@@ -1,0 +1,21 @@
+{$PUBLIC_HOST:relay.example.com} {
+	encode zstd gzip
+
+	@control path /api/* /media/* /health
+	handle @control {
+		reverse_proxy relay-router:8787
+	}
+
+	handle {
+		reverse_proxy relay-site:3000
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+}

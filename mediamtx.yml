@@ -1,0 +1,30 @@
+logLevel: info
+logDestinations: [stdout]
+readTimeout: 5s
+writeTimeout: 10s
+
+authMethod: http
+authHTTPAddress: http://router:8787/internal/mediamtx-auth
+authHTTPExclude:
+  - action: api
+
+api: true
+apiAddress: :9997
+
+rtsp: true
+rtspAddress: :8554
+rtmp: false
+hls: true
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsAlwaysRemux: false
+webrtc: false
+srt: true
+srtAddress: :8890
+
+paths:
+  studio:
+    source: publisher
+    overridePublisher: true
+    alwaysAvailable: true
+    alwaysAvailableFile: /relay-data/media/studio/active.mp4
