@@ -170,19 +170,21 @@ function signalHealth(signal: SignalMetrics, online: boolean): { label: string; 
   return { label: "Healthy", tone: "armed" };
 }
 
-type AudioRoute = { platform: string; label: string; maps: string; note: string; why: string; degrade: string };
+type AudioRoute = { platform: string; label: string; maps: string; note: string; why: string };
 
 /** The user-facing copy of build_audio_args() in router/app/main.py — change
  *  both together. Routing is a property of the platform, never a setting: Relay
  *  never mixes and never re-encodes, so the only question left is which of the
- *  two OBS tracks a platform is allowed to hear. The one exception is `degrade`
- *  on YouTube and X, which the operator can move per destination. */
+ *  two OBS tracks a platform is allowed to hear.
+ *
+ *  `why` is only used where someone is actually choosing a platform — the Add
+ *  destination dialog. The reference table states the routing and stops. */
 const audioRoutes: AudioRoute[] = [
-  { platform: "twitch", label: "Twitch", maps: "Tracks 1 + 2", note: "live plus VOD", why: "Track 1 is what live viewers hear. Track 2 travels alongside it as the Twitch VOD track, so the saved video has no music.", degrade: "Track 1 alone — live viewers are unaffected, but the VOD keeps the music." },
-  { platform: "youtube", label: "YouTube", maps: "Track 2", note: "clean, no music", why: "YouTube scans the archive for music, so it only ever receives the clean mix.", degrade: "Track 1 — your music mix — so the stream stays up. Switch that destination to mute if you would rather it went silent." },
-  { platform: "x", label: "X", maps: "Track 2", note: "clean, no music", why: "X publishes the replay automatically — and the music is a reason to come to Twitch.", degrade: "Track 1 — your music mix — so the stream stays up. Switch that destination to mute if you would rather it went silent." },
-  { platform: "rplay", label: "RPLAY", maps: "Track 1", note: "full live mix", why: "Nothing stays published afterwards, so RPLAY hears exactly what Twitch viewers hear.", degrade: "No change — Track 1 is what it receives anyway." },
-  { platform: "custom", label: "Custom RTMP", maps: "Track 1", note: "full live mix", why: "The full live experience is the least surprising thing to send somewhere Relay knows nothing about.", degrade: "No change — Track 1 is what it receives anyway." },
+  { platform: "twitch", label: "Twitch", maps: "Tracks 1 + 2", note: "live plus VOD", why: "Track 1 is what live viewers hear. Track 2 travels alongside it as the Twitch VOD track, so the saved video has no music." },
+  { platform: "youtube", label: "YouTube", maps: "Track 2", note: "clean, no music", why: "YouTube scans the archive for music, so it only ever receives the clean mix." },
+  { platform: "x", label: "X", maps: "Track 2", note: "clean, no music", why: "X publishes the replay automatically — and the music is a reason to come to Twitch." },
+  { platform: "rplay", label: "RPLAY", maps: "Track 1", note: "full live mix", why: "Nothing stays published afterwards, so RPLAY hears exactly what Twitch viewers hear." },
+  { platform: "custom", label: "Custom RTMP", maps: "Track 1", note: "full live mix", why: "The full live experience is the least surprising thing to send somewhere Relay knows nothing about." },
 ];
 
 /** An unrecognised platform lands on the custom row, matching the router's own
@@ -215,32 +217,39 @@ function musicFallbackOn(destination: Destination): boolean {
   return Boolean(destination.music_fallback);
 }
 
-/** Plain-language list: "YouTube", "YouTube and X", "A, B, and C". */
-function listNames(items: Destination[]): string {
-  const names = items.map((item) => item.name);
-  if (names.length < 3) return names.join(" and ");
-  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
-}
-
 /** What a destination is mapping *right now*, which is not always what its
  *  platform row promises. The forwarders degrade every destination when fewer
  *  than two tracks arrive, so repeating the normal routing during a one-track
  *  publish would claim a Track 2 that nothing is actually sending. */
 function effectiveAudio(destination: Destination, arriving: number | null): { label: string; tone: "" | "degraded" | "risk" } {
+  const described = describeAudio(destination, arriving);
+  // Colour marks something happening, never something forecast. A destination
+  // that is off is carrying nothing, so tinting it red is the permanent
+  // alarm-with-nothing-to-act-on this panel exists to avoid. The label still
+  // says what it would send, quietly. This pairs the row with TrackTwoAlert,
+  // which is gated on the same condition.
+  return destination.enabled ? described : { ...described, tone: "" };
+}
+
+function describeAudio(destination: Destination, arriving: number | null): { label: string; tone: "" | "degraded" | "risk" } {
   const normal = audioRouteLabel(destination.platform);
   // null is "not known yet", not "none" — assume the documented layout, exactly
   // as the router does when the worker starts before OBS connects.
   if (arriving == null || arriving >= 2) return { label: normal, tone: "" };
   if (arriving === 0) return { label: "Muted (OBS is sending no audio)", tone: "degraded" };
   if (hasMusicFallbackChoice(destination.platform)) {
-    // Track 1 is the default here, so this is the label most YouTube and X rows
-    // will show during a one-track publish. It has to name the music outright.
-    if (musicFallbackOn(destination)) return { label: "Track 1 (Track 2 unavailable — carries your music)", tone: "risk" };
-    // Relay fixes the mapping when a forwarder starts and clearing the flag
-    // deliberately does not restart it, so a destination that is already running
-    // may still be sending Track 1. Never call it silent until it has restarted.
-    return destination.enabled
-      ? { label: "Set to mute — applies when this destination restarts", tone: "risk" }
+    // Relay fixes the mapping when a forwarder starts and this PATCH deliberately
+    // does not restart it, so for a running destination the stored choice and the
+    // live `-map` set can disagree in BOTH directions. Say what it is set to,
+    // never what it is doing. An off destination is a forecast, so it reads
+    // plainly.
+    if (destination.enabled) {
+      return musicFallbackOn(destination)
+        ? { label: "Set to send Track 1 — carries your music", tone: "risk" }
+        : { label: "Set to mute — applies when this destination restarts", tone: "risk" };
+    }
+    return musicFallbackOn(destination)
+      ? { label: "Track 1 (Track 2 unavailable — carries your music)", tone: "risk" }
       : { label: "Muted (Track 2 unavailable)", tone: "degraded" };
   }
   if (destination.platform === "twitch") return { label: "Track 1 (Track 2 unavailable — no VOD track)", tone: "degraded" };
@@ -255,39 +264,27 @@ function archiveConsequence(platform: string): string {
     : "X publishes the replay publicly and keeps it.";
 }
 
-/** The compensating control for the fallback default. YouTube and X now carry
- *  Track 1 when the clean track never arrives, which keeps them on the air but
- *  puts the music mix into two archives that scan it. A destination row alone
- *  cannot carry that — the operator has to see it without going looking, at the
- *  top of the page, in the state where it is actually happening.
+/** One-track publish, and only while something is actually forwarding. Nobody
+ *  needs an alert about a clean track that no destination is waiting for, so a
+ *  page with every output off stays quiet.
  *
- *  It only ever describes what OBS is sending, never what a running forwarder
- *  is mapping: Relay picks the mapping when a forwarder starts, so an enabled
- *  destination and its stored setting can legitimately disagree.
+ *  It leads with the only real repair — Track 2 in OBS — and stops there. The
+ *  per-destination consequences live on the rows, which is where the operator
+ *  can act on them; repeating them here is what made this a wall of text.
  *
- *  The fix it names is Track 2 in OBS, not this setting. Muting is a different
- *  degraded outcome, not a repair. */
+ *  It never describes what a running forwarder is mapping: Relay picks the
+ *  mapping when a forwarder starts, so an enabled destination and its stored
+ *  setting can legitimately disagree. */
 function TrackTwoAlert({ destinations, arriving }: { destinations: Destination[]; arriving: number | null }) {
-  // Only the one-track case. At zero tracks nothing has a mix to choose from,
-  // and the panel's own no-audio line already says so.
+  // Only the one-track case. At zero tracks nothing has a mix to choose from.
   if (arriving !== 1) return null;
-  const choosers = destinations.filter((destination) => hasMusicFallbackChoice(destination.platform));
-  const carrying = choosers.filter(musicFallbackOn);
-  // A forwarder keeps the mapping it started with, so clearing the flag does not
-  // stop music that is already going out. These stay lit — and keep the panel
-  // red — until the operator actually restarts them.
-  const pending = choosers.filter((destination) => !musicFallbackOn(destination) && Boolean(destination.enabled));
-  const muting = choosers.filter((destination) => !musicFallbackOn(destination) && !destination.enabled);
+  if (!destinations.some((destination) => Boolean(destination.enabled))) return null;
   return (
-    <div className={`track-alert ${carrying.length || pending.length ? "music" : ""}`} role="alert">
+    <div className="track-alert" role="alert">
       <span className="track-alert-mark" aria-hidden="true">!</span>
       <div className="track-alert-body">
         <strong>OBS is sending one audio track</strong>
-        <p>Track 2 — your clean mix, no music — is not arriving, so nothing Relay forwards can be clean.{carrying.length ? <> <b>{listNames(carrying)}</b> {carrying.length === 1 ? "is" : "are"} set to fall back to Track 1: your full mix, with every song you played in it. {carrying.some((destination) => destination.platform === "youtube") ? "YouTube runs Content ID over the saved video. " : ""}{carrying.some((destination) => destination.platform === "x") ? "X publishes the replay and keeps it. " : ""}That audio stays there.</> : null}</p>
-        <p className="track-alert-fix"><b>Fix this in OBS, not here.</b> Turn on audio Track 2 under Settings → Output → Advanced, and check that your Track 2 encoder is set to the clean mix. The fallback setting only picks which degraded outcome you get; it cannot give a destination back a clean track that OBS never sent.</p>
-        {Boolean(pending.length) && <p className="track-alert-note">{listNames(pending)} {pending.length === 1 ? "is" : "are"} set to mute, but {pending.length === 1 ? "it is" : "they are"} still forwarding with whatever {pending.length === 1 ? "mapping it" : "mappings they"} started with. Stop and start {pending.length === 1 ? "it" : "them"} to apply that.</p>}
-        {Boolean(muting.length) && <p className="track-alert-note">{listNames(muting)} {muting.length === 1 ? "is" : "are"} set to mute instead: Relay gives {muting.length === 1 ? "it" : "them"} no audio track at all while Track 2 is missing.</p>}
-        <p className="track-alert-note">Relay picks each destination’s audio when its forwarder starts. A destination that is already running keeps what it started with until you stop it and start it again.</p>
+        <p>Turn on <b>Track 2</b> in OBS under Settings → Output → Advanced and point it at your clean mix. Until it arrives there is no clean track to forward, so each destination below shows what it is sending instead.</p>
       </div>
     </div>
   );
@@ -405,79 +402,68 @@ function OutputsPanel({ destinations }: { destinations: Destination[] }) {
   );
 }
 
-/** Reference, mostly: the answer to "why does YouTube sound different?" has to
- *  be visible without asking anyone. The one thing an operator can move — what
- *  YouTube and X do when the clean track never arrives — lives on each of those
- *  destinations, so this panel states the rule and points at the control. */
+/** Reference, and nothing more: the answer to "why does YouTube sound
+ *  different?" has to be visible without asking anyone. Deliberately quiet —
+ *  no warning tone lives here, because a routing rule is never a problem. What
+ *  happens when a track is missing is a live condition, so it is raised on the
+ *  destination it affects, at the moment it affects it. */
 function AudioRoutingPanel({ media }: { media: StreamState["stream"]["media"] }) {
   const arriving = audioTrackCount(media);
-  const degraded = arriving != null && arriving < 2;
+  const healthy = arriving != null && arriving >= 2;
   return (
     <section className="audio-routing" id="audio" aria-labelledby="audio-routing-title">
       <div className="section-heading">
         <div><p className="eyebrow">AUDIO ROUTING</p><h2 id="audio-routing-title">Fixed by platform</h2></div>
-        <span className={`status-chip ${degraded || arriving == null ? "disabled" : "armed"}`}>{arriving == null ? "Waiting for OBS" : `${arriving} track${arriving === 1 ? "" : "s"} arriving`}</span>
+        <span className={`status-chip ${healthy ? "armed" : "disabled"}`} role="status">{arriving == null ? "Waiting for OBS" : `${arriving} track${arriving === 1 ? "" : "s"} arriving`}</span>
       </div>
-      <p className="audio-copy">Relay never mixes your audio and never re-encodes it. OBS makes every mix; Relay forwards the tracks exactly as they arrive. Which track a destination hears comes from its platform, so there is nothing to choose here — except what YouTube and X should do if the clean track never arrives, which you set on each of those destinations.</p>
       <div className="audio-contract">
-        <div><b>Track 1 — full live mix</b><span>Music, game, and voice. What Twitch live viewers hear.</span></div>
-        <div><b>Track 2 — clean mix</b><span>Game and voice, no music. Safe for anything that gets archived or republished.</span></div>
+        <div><b>Track 1 — full live mix</b><span>Music, game, and voice.</span></div>
+        <div><b>Track 2 — clean mix</b><span>Game and voice, no music.</span></div>
       </div>
-      <p className="audio-degrade-rule">If OBS sends fewer than two tracks there is no clean mix to send, and Relay still never mixes or re-encodes to invent one. Twitch keeps its live audio and loses the separate VOD track. YouTube and X fall back to Track 1 — music and all — so they stay on the air, because a stream carrying no audio track at all is not something either ingest is known to accept. You can switch either of them to mute instead, on that destination.</p>
       <div className="audio-table-wrap">
         <table className="audio-table">
-          <thead><tr><th scope="col">Platform</th><th scope="col">Receives</th><th scope="col">Why</th><th scope="col">If Track 2 is missing</th></tr></thead>
+          <thead><tr><th scope="col">Platform</th><th scope="col">Receives</th><th scope="col">Notes</th></tr></thead>
           <tbody>{audioRoutes.map((route) => (
             <tr key={route.platform}>
               <th scope="row"><span className="audio-platform"><PlatformIcon platform={route.platform} fallback="•" />{route.label}</span></th>
               <td className="audio-maps">{route.maps}</td>
-              <td className="audio-why">{route.why}</td>
-              <td className={hasMusicFallbackChoice(route.platform) ? "audio-degrade choice" : "audio-degrade"}>{route.degrade}</td>
+              <td>{route.note}</td>
             </tr>
           ))}</tbody>
         </table>
       </div>
-      <p className={`audio-note ${degraded ? "warn" : ""}`} role={degraded ? "status" : undefined}>
-        {!degraded ? "In OBS, send Tracks 1 and 2 under Advanced Output. You can send up to six tracks — Relay carries the rest through untouched and never maps them."
-          : arriving ? "OBS is sending one audio track. Every destination carries Track 1, music included, except any YouTube or X destination you have switched to mute. Turn on Track 2 in OBS to restore normal routing."
-          : "OBS is sending video with no audio track, so destinations are carrying video only."}
-      </p>
+      <p className="audio-note">Relay never mixes or re-encodes. Send Tracks 1 and 2 from OBS and each destination gets the right one.</p>
     </section>
   );
 }
 
-/** The only user-facing audio setting, and only on YouTube and X. Two named
- *  outcomes rather than a switch, because "off" and "on" say nothing about what
- *  reaches the archive — and the consequence sits in the open next to them, not
- *  behind a tooltip, since a wrong belief about what is being published is the
- *  entire failure this control exists to prevent.
+/** The only user-facing audio setting, and only on YouTube and X. It decides
+ *  nothing while both tracks arrive, so it is rendered in exactly one place —
+ *  the start-forwarding dialog during a one-track publish, where the operator
+ *  is choosing in the moment rather than reading a fieldset that has sat on
+ *  every YouTube and X row since the day the destination was added.
  *
- *  Track 1 is first because it is the default the router applies to a new
- *  destination; muting is the deliberate departure. `exercised` is true only
- *  while OBS is actually sending one track, so the alarmed styling marks the
- *  state where this setting is deciding something rather than sitting on every
- *  YouTube and X row forever. */
-function MusicFallbackChoice({ platform, value, busy = false, exercised = false, group, owner, onChoose, children }: { platform: string; value: boolean; busy?: boolean; exercised?: boolean; group: string; owner?: string; onChoose: (enabled: boolean) => void; children?: React.ReactNode }) {
+ *  Two named outcomes rather than a switch: "on" and "off" say nothing about
+ *  what reaches an archive. Track 1 is first because it is the router's own
+ *  default for a new destination; muting is the deliberate departure. The
+ *  caller supplies the warning and the consequence — this is just the pills. */
+function MusicFallbackChoice({ value, busy = false, group, owner, onChoose }: { value: boolean; busy?: boolean; group: string; owner: string; onChoose: (enabled: boolean) => void }) {
   return (
-    // The destinations list repeats this group once per YouTube/X row, so the
-    // legend alone would announce five identical "If Track 2 is unavailable"
-    // groups with nothing to tell them apart. `owner` names the destination.
-    <fieldset className={`fallback-choice ${exercised ? (value ? "risk" : "degraded") : ""}`} disabled={busy} aria-label={owner ? `${owner}: if Track 2 is unavailable` : undefined}>
-      <legend>If Track 2 is unavailable</legend>
+    // `owner` names the destination: the legend alone would announce as an
+    // unlabelled "Send instead" group in a dialog that never says which row it
+    // belongs to.
+    <fieldset className="fallback-choice" disabled={busy} aria-label={`${owner}: what to send while Track 2 is missing`}>
+      <legend>Send instead</legend>
       <div className="fallback-options">
         <label className={value ? "chosen" : ""}>
           <input type="radio" name={group} checked={value} onChange={() => onChoose(true)} />
-          <span>Send Track 1 (may contain music)</span>
+          <span>Track 1 (has your music)</span>
         </label>
         <label className={value ? "" : "chosen"}>
           <input type="radio" name={group} checked={!value} onChange={() => onChoose(false)} />
-          <span>Mute audio</span>
+          <span>No audio</span>
         </label>
       </div>
-      <p className="fallback-consequence">
-        Track 1 is the default: this destination keeps sound and stays on the air, but your full music mix — every song you played — goes out with it. {archiveConsequence(platform)} Muting keeps the music out, and means Relay publishes video with no audio track at all, which not every ingest is known to accept.
-      </p>
-      {children}
     </fieldset>
   );
 }
@@ -658,6 +644,10 @@ export default function Home() {
   // can name the one the forwarders are really mapping. null means "not known
   // yet" and the documented two-track layout is assumed, as in the router.
   const arrivingTracks = audioTrackCount(state.stream.media);
+  // pendingToggle is a snapshot taken when the switch was clicked. The start
+  // dialog can change music_fallback before starting, so read the row back out
+  // of the refreshed state or the pills would keep drawing the old choice.
+  const toggleLive = pendingToggle ? state.destinations.find((item) => item.id === pendingToggle.id) ?? pendingToggle : null;
   const programMode = state.screens.program_mode;
   const programLabel = programMode === "starting_soon" ? "Starting Soon" : programMode === "brb" ? "BRB" : "Live input";
   const manualScreen = programMode !== "live";
@@ -692,8 +682,8 @@ export default function Home() {
     finally { setToggleBusy(false); }
   }
 
-  async function applyMusicFallback(destination: Destination, enabled: boolean) {
-    setError("");
+  async function applyMusicFallback(destination: Destination, enabled: boolean, inDialog = false) {
+    if (inDialog) setModalError(""); else setError("");
     setFallbackBusy(destination.id);
     try {
       await json(`/api/destinations/${destination.id}/music-fallback`, {
@@ -701,8 +691,15 @@ export default function Home() {
         body: JSON.stringify({ enabled }),
       });
       await refreshState();
-    } catch (err) { setError(err instanceof Error ? err.message : "Could not change the audio fallback"); }
-    finally { setFallbackBusy(0); setPendingMute(null); }
+      setPendingMute(null);
+    } catch (err) {
+      // The backdrop hides the page-level notice completely, so a failure raised
+      // from inside a dialog has to render there — and the dialog has to stay
+      // open, or the operator never sees why their choice did not stick.
+      const message = err instanceof Error ? err.message : "Could not change the audio fallback";
+      if (inDialog) setModalError(message); else setError(message);
+    }
+    finally { setFallbackBusy(0); }
   }
 
   function chooseMusicFallback(destination: Destination, enabled: boolean) {
@@ -711,7 +708,7 @@ export default function Home() {
     // what Relay does by default, and the only one of the two that can end with
     // a destination refusing the stream or archiving it silent. Choosing
     // Track 1 puts the destination back on the default, so it applies at once.
-    if (!enabled) { setPendingMute(destination); return; }
+    if (!enabled) { setModalError(""); setPendingMute(destination); return; }
     void applyMusicFallback(destination, true);
   }
 
@@ -842,28 +839,32 @@ export default function Home() {
           {state.destinations.length ? <div className="destination-list">{state.destinations.map((destination) => {
             const status = destinationStatus(destination);
             const audio = effectiveAudio(destination, arrivingTracks);
+            // The fallback only decides something while OBS is short a track and
+            // this destination is actually forwarding. Anywhere else it is a
+            // setting with no consequence, so the row shows nothing at all.
+            const decidingFallback = hasMusicFallbackChoice(destination.platform) && arrivingTracks === 1 && Boolean(destination.enabled);
+            const carryingMusic = musicFallbackOn(destination);
             return (
             <div className="destination-row" key={destination.id}>
               <PlatformIcon platform={destination.platform} fallback={destination.name[0]?.toUpperCase()} /><div className="destination-name"><strong>{destination.name}</strong><span className={`destination-audio ${audio.tone}`}>{audio.label}</span></div>
               <div className={`route-status ${status.tone}`}><span />{status.label}</div>
               <div className="destination-actions">
                 <button className="text-button" type="button" aria-label={`Remove ${destination.name}`} onClick={() => { setModalError(""); setPendingRemove(destination); }}>Remove</button>
-                <button className={`toggle ${destination.enabled ? "on" : ""}`} type="button" role="switch" aria-checked={Boolean(destination.enabled)} aria-label={`${destination.enabled ? "Stop" : "Start"} ${destination.name} forwarding`} onClick={() => setPendingToggle(destination)}><span /></button>
+                <button className={`toggle ${destination.enabled ? "on" : ""}`} type="button" role="switch" aria-checked={Boolean(destination.enabled)} aria-label={`${destination.enabled ? "Stop" : "Start"} ${destination.name} forwarding`} onClick={() => { setModalError(""); setPendingToggle(destination); }}><span /></button>
               </div>
               {destination.last_error && Boolean(destination.enabled) && <p className="destination-error">{destination.last_error}</p>}
-              {hasMusicFallbackChoice(destination.platform) && <MusicFallbackChoice platform={destination.platform} value={musicFallbackOn(destination)} exercised={arrivingTracks === 1} busy={fallbackBusy === destination.id} group={`music-fallback-${destination.id}`} owner={destination.name} onChoose={(enabled) => chooseMusicFallback(destination, enabled)}>
-                {/* Only ever state what OBS is sending. Relay picks the mapping when a
-                    forwarder starts, and changing this setting deliberately does not
-                    restart it, so for a running destination the stored choice and the
-                    live `-map` set can disagree. Claiming "is silent" here would tell an
-                    operator the music stopped while it is still going out. */}
-                {audio.tone !== "" && <p className="fallback-live" role="status">Happening now: {arrivingTracks === 0
-                  ? "OBS is sending no audio at all."
-                  : "Track 2 is not arriving from OBS."}</p>}
-                {destination.enabled
-                  ? <p className="fallback-timing">{destination.name} is still sending whatever mapping it started with. Stop it and start it again to apply this setting.</p>
-                  : <p className="fallback-timing">This applies the next time {destination.name} starts.</p>}
-              </MusicFallbackChoice>}
+              {/* One line, one action. "is set to send" rather than "is sending"
+                  for the muted case: Relay picks the mapping when a forwarder
+                  starts and this PATCH deliberately does not restart it, so the
+                  stored choice and the live `-map` set can disagree. The row's
+                  own audio label carries that caveat once, quietly. */}
+              {decidingFallback && <p className="fallback-line">
+                <span className="fallback-mark" aria-hidden="true">⚠</span>
+                <span>Track 2 isn’t arriving, so this is set to send {carryingMusic ? "Track 1, which carries your music." : "no audio at all."}</span>
+                <button type="button" className="text-button fallback-action" disabled={fallbackBusy === destination.id}
+                  aria-label={carryingMusic ? `Mute ${destination.name} instead while Track 2 is missing` : `Send Track 1 to ${destination.name} while Track 2 is missing`}
+                  onClick={() => chooseMusicFallback(destination, !carryingMusic)}>{carryingMusic ? "Mute instead" : "Send Track 1"}</button>
+              </p>}
             </div>);
           })}</div> : <div className="empty-state"><strong>No destinations yet</strong><span>Add Twitch first, then YouTube — Relay sends YouTube your clean track on its own.</span><button onClick={() => setShowAdd(true)}>Add your first destination</button></div>}
         </section>
@@ -883,7 +884,21 @@ export default function Home() {
       {showOnboarding && <OnboardingTour state={state} onClose={() => { rememberOnboarding("dismissed"); setShowOnboarding(false); }} onFinish={finishOnboarding} />}
       {showObs && <Modal title="Connect OBS" onClose={() => setShowObs(false)}><p className="modal-copy">In OBS, choose <strong>Custom</strong> service, paste this into <strong>Server</strong>, and leave Stream Key blank.</p><label htmlFor="obs-url">Private SRT server address</label><div className="copy-field"><input id="obs-url" readOnly value={state.stream.obs_url} /><button onClick={copyObs}>{copied ? "Copied" : "Copy"}</button></div><p className="hint">Then enable audio <strong>Tracks 1 and 2</strong> under Advanced Output. Track 1 is your full live mix with music; Track 2 is the same mix without it.</p></Modal>}
       {showAdd && <AddDestination csrf={state.csrf} twitchIngest={state.twitch_ingest} onClose={() => setShowAdd(false)} onAdded={async () => { setShowAdd(false); await refreshState(); }} />}
-      {pendingToggle && <Modal title={`${pendingToggle.enabled ? "Stop" : "Start"} ${pendingToggle.name}?`} onClose={() => { if (!toggleBusy) setPendingToggle(null); }}><p className="modal-copy">{pendingToggle.enabled ? `Relay will disconnect from ${pendingToggle.name}. Viewers there will lose the feed until you turn it on again.` : `Relay will immediately send your live input—or the protected backup screen—to ${pendingToggle.name}.`}</p><div className="confirm-destination"><PlatformIcon platform={pendingToggle.platform} fallback={pendingToggle.name[0]?.toUpperCase()} /><div><strong>{pendingToggle.name}</strong><span>{effectiveAudio(pendingToggle, arrivingTracks).label}</span></div></div><div className="modal-actions"><button type="button" className="secondary" disabled={toggleBusy} onClick={() => setPendingToggle(null)}>Cancel</button><button type="button" className={pendingToggle.enabled ? "danger" : "primary"} disabled={toggleBusy} onClick={confirmToggle}>{toggleBusy ? "Working…" : pendingToggle.enabled ? "Stop forwarding" : "Start forwarding"}</button></div></Modal>}
+      {pendingToggle && toggleLive && <Modal title={`${pendingToggle.enabled ? "Stop" : "Start"} ${pendingToggle.name}?`} onClose={() => { if (!toggleBusy) setPendingToggle(null); }}>
+        <p className="modal-copy">{pendingToggle.enabled ? `Relay will disconnect from ${pendingToggle.name}. Viewers there will lose the feed until you turn it on again.` : `Relay will immediately send your live input—or the protected backup screen—to ${pendingToggle.name}.`}</p>
+        <div className="confirm-destination"><PlatformIcon platform={pendingToggle.platform} fallback={pendingToggle.name[0]?.toUpperCase()} /><div><strong>{pendingToggle.name}</strong><span>{effectiveAudio(toggleLive, arrivingTracks).label}</span></div></div>
+        {/* The one moment the operator is literally going live with a missing
+            track, so this is the one place the choice is worth interrupting for.
+            It never blocks the start — the pills save on their own and the
+            forwarder picks up whichever one is stored when it starts. */}
+        {!pendingToggle.enabled && arrivingTracks === 1 && hasMusicFallbackChoice(pendingToggle.platform) && <div className="start-audio">
+          <p className="start-audio-warn" role="status"><span className="fallback-mark" aria-hidden="true">⚠</span> <b>OBS is only sending Track 1.</b> There is no clean mix for {pendingToggle.name} right now — pick what it should send until Track 2 comes back.</p>
+          <MusicFallbackChoice value={musicFallbackOn(toggleLive)} busy={fallbackBusy === toggleLive.id} group={`start-music-fallback-${toggleLive.id}`} owner={pendingToggle.name} onChoose={(enabled) => applyMusicFallback(toggleLive, enabled, true)} />
+          {modalError && <p className="form-error" role="alert">{modalError}</p>}
+          <p className="start-audio-note">Track 1 keeps it on the air with your music in it. {archiveConsequence(pendingToggle.platform)} No audio sends video with no audio track at all, which not every ingest is known to accept.</p>
+        </div>}
+        <div className="modal-actions"><button type="button" className="secondary" disabled={toggleBusy} onClick={() => setPendingToggle(null)}>Cancel</button><button type="button" className={pendingToggle.enabled ? "danger" : "primary"} disabled={toggleBusy || Boolean(fallbackBusy)} onClick={confirmToggle}>{toggleBusy ? "Working…" : pendingToggle.enabled ? "Stop forwarding" : "Start forwarding"}</button></div>
+      </Modal>}
       {pendingScreenMode && <Modal title={pendingScreenMode === "live" ? "Return to live input?" : pendingScreenMode === "brb" ? "Put BRB on air?" : "Put Starting Soon on air?"} onClose={() => { if (!protectionBusy) setPendingScreenMode(null); }}><p className="modal-copy">{pendingScreenMode === "live" ? "Relay will allow OBS to reconnect. The BRB screen stays on air until the OBS signal arrives." : programMode === "live" ? "Relay will temporarily disconnect and hold OBS so this screen can feed every enabled destination. Automatic outage ads will not run during a manual screen." : "Relay will switch the current program screen while keeping enabled destinations connected."}</p><div className="confirm-destination screen-confirm"><div className="screen-confirm-icon">{pendingScreenMode === "live" ? "●" : pendingScreenMode === "brb" ? "B" : "S"}</div><div><strong>{pendingScreenMode === "live" ? "Live OBS input" : pendingScreenMode === "brb" ? "BRB / connection lost" : "Starting Soon"}</strong><span>{pendingScreenMode === "live" ? "OBS reconnect permitted" : "Manual program takeover"}</span></div></div><div className="modal-actions"><button type="button" className="secondary" disabled={protectionBusy} onClick={() => setPendingScreenMode(null)}>Cancel</button><button type="button" className="primary" disabled={protectionBusy} onClick={() => changeScreenMode(pendingScreenMode)}>{protectionBusy ? "Switching…" : pendingScreenMode === "live" ? "Return to live input" : "Put screen on air"}</button></div></Modal>}
       {pendingRemove && <Modal title={`Remove ${pendingRemove.name}?`} onClose={() => { if (!toggleBusy) setPendingRemove(null); }}>
         <p className="modal-copy">Relay stops forwarding to {pendingRemove.name} and forgets its stream key. You can add it again with a new key at any time.</p>
@@ -892,11 +907,12 @@ export default function Home() {
         <div className="modal-actions"><button type="button" className="secondary" disabled={toggleBusy} onClick={() => setPendingRemove(null)}>Cancel</button><button type="button" className="danger" disabled={toggleBusy} onClick={removeDestination}>{toggleBusy ? "Removing…" : "Remove destination"}</button></div>
       </Modal>}
       {pendingMute && <Modal title={`Mute ${pendingMute.name} when Track 2 is missing?`} onClose={() => { if (!fallbackBusy) setPendingMute(null); }}>
-        <p className="modal-copy">Only if Track 2 is missing. While OBS sends both tracks nothing changes — {pendingMute.name} keeps receiving the clean mix.</p>
-        <p className="modal-copy">If OBS ever publishes with one track, Relay will send {pendingMute.name} video with no audio track at all rather than your music mix. It is not confirmed that {platformMarks[pendingMute.platform]?.label || pendingMute.platform} accepts a stream shaped that way: it may refuse the connection outright, or take it and keep a silent recording. Choose this only if a silent — or rejected — stream is better for you than music in that archive.</p>
+        <p className="modal-copy">Only while Track 2 is missing. As soon as OBS sends both tracks again, {pendingMute.name} goes back to the clean mix.</p>
+        <p className="modal-copy">Relay will send video with no audio track at all instead of your music mix. {platformMarks[pendingMute.platform]?.label || pendingMute.platform} may refuse a stream shaped that way, or keep a silent recording — pick this only if that is better than music in the archive.</p>
         <div className="confirm-destination fallback-confirm"><PlatformIcon platform={pendingMute.platform} fallback={pendingMute.name[0]?.toUpperCase()} /><div><strong>{pendingMute.name}</strong><span>Fallback becomes silence — no audio track</span></div></div>
         {Boolean(pendingMute.enabled) && <p className="hint">Relay picks the mapping when a forwarder starts, so this applies the next time {pendingMute.name} starts. Nothing already going out is interrupted.</p>}
-        <div className="modal-actions"><button type="button" className="secondary" disabled={Boolean(fallbackBusy)} onClick={() => setPendingMute(null)}>Cancel</button><button type="button" className="danger" disabled={Boolean(fallbackBusy)} onClick={() => applyMusicFallback(pendingMute, false)}>{fallbackBusy ? "Saving…" : "Mute audio"}</button></div>
+        {modalError && <p className="form-error" role="alert">{modalError}</p>}
+        <div className="modal-actions"><button type="button" className="secondary" disabled={Boolean(fallbackBusy)} onClick={() => setPendingMute(null)}>Cancel</button><button type="button" className="danger" disabled={Boolean(fallbackBusy)} onClick={() => applyMusicFallback(pendingMute, false, true)}>{fallbackBusy ? "Saving…" : "Mute audio"}</button></div>
       </Modal>}
       {pendingAutoArm && <Modal title="Arm automatic outage ads?" onClose={() => { if (!protectionBusy) setPendingAutoArm(false); }}><p className="modal-copy">If a real OBS connection drops and stays offline for one minute, Relay will check Twitch and run the minimum commercial needed to restore 60 minutes of preroll-free time. It will make one attempt and will not ask for approval while you are offline.</p><div className="confirm-destination auto-ad-confirm"><PlatformIcon platform="twitch" /><div><strong>Automatic Twitch outage ad</strong><span>Persistent until you disable it</span></div></div><div className="modal-actions"><button className="secondary" disabled={protectionBusy} onClick={() => setPendingAutoArm(false)}>Cancel</button><button className="primary" disabled={protectionBusy} onClick={() => setFailoverAds(true)}>{protectionBusy ? "Arming…" : "Arm automatic ads"}</button></div></Modal>}
     </main>
@@ -1122,10 +1138,6 @@ function Modal({ title, onClose, children }: { title:string; onClose:()=>void; c
 function AddDestination({ csrf, twitchIngest, onClose, onAdded }: { csrf:string; twitchIngest:StreamState["twitch_ingest"]; onClose:()=>void; onAdded:()=>Promise<void> }) {
   const [platform, setPlatform] = useState("twitch");
   const [name, setName] = useState("Twitch");
-  // Starts where the router starts a new YouTube or X destination: Track 1. The
-  // form has to agree with the API's own default or the dashboard would quietly
-  // create destinations that behave differently from ones created any other way.
-  const [musicFallback, setMusicFallback] = useState(true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -1133,10 +1145,6 @@ function AddDestination({ csrf, twitchIngest, onClose, onAdded }: { csrf:string;
     const names: Record<string, string> = { twitch:"Twitch", youtube:"YouTube", rplay:"RPLAY", x:"X", custom:"Custom" };
     setPlatform(value);
     setName(names[value] || "Custom");
-    // Back to the default on every platform change, so a mute chosen for
-    // YouTube cannot follow the form onto a fresh destination that never asked
-    // for it.
-    setMusicFallback(true);
   }
 
   async function submit(event: FormEvent<HTMLFormElement>) {
@@ -1145,16 +1153,11 @@ function AddDestination({ csrf, twitchIngest, onClose, onAdded }: { csrf:string;
     setError("");
     setBusy(true);
     const data = new FormData(event.currentTarget);
-    // Built by hand rather than from FormData: music_fallback is a real boolean
-    // the router validates, not a form string, and the radios must not leak a
-    // stray field into the body.
+    // music_fallback is deliberately never sent. Adding a destination is not a
+    // moment when the setting decides anything — it only matters during a
+    // one-track publish — so the router resolves its own per-platform default
+    // and the operator meets the choice when it actually costs them something.
     const body: Record<string, unknown> = { name, platform, output_url:String(data.get("output_url") ?? "") };
-    // Omitted entirely off YouTube and X rather than sent as false. The router
-    // rejects an explicit value on any other platform — including the `true` it
-    // now defaults to — so leaving the key out lets it resolve the platform's
-    // own default and keeps the "which platforms have a choice" rule in exactly
-    // one place instead of two that can drift apart.
-    if (hasMusicFallbackChoice(platform)) body.music_fallback = musicFallback;
     try {
       await json("/api/destinations", {
         method:"POST",
@@ -1181,7 +1184,6 @@ function AddDestination({ csrf, twitchIngest, onClose, onAdded }: { csrf:string;
     {platform === "rplay" && <p className="hint">Relay automatically sends this key through <strong>livestream-push.rplay.live</strong>.</p>}
     {platform === "x" && <p className="hint">Relay sends this key through <strong>ca.pscp.tv:80/x</strong>. Paste only the X stream key.</p>}
     <div className="audio-preset"><span>AUDIO</span><strong>{route.maps} · {route.note}</strong><small>{route.why}</small></div>
-    {hasMusicFallbackChoice(platform) && <MusicFallbackChoice platform={platform} value={musicFallback} busy={busy} group="new-destination-music-fallback" onChoose={setMusicFallback} />}
     {error && <span className="form-error">{error}</span>}
     <div className="modal-actions"><button type="button" className="secondary" disabled={busy} onClick={onClose}>Cancel</button><button className="primary" type="submit" disabled={busy}>{busy ? "Saving…" : "Save destination"}</button></div>
   </form></Modal>;
