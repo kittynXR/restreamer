@@ -66,4 +66,4 @@ Keep backups outside the public repository. Test restores on a separate Docker v
 - Forwarder repeatedly reconnects: inspect the destination’s redacted last error and router logs; verify the platform key is current.
 - BRB unavailable for a new user: upload a ready BRB for the owner first so `_default/brb.mp4` can seed invited users.
 - Twitch outage ads unavailable: verify OAuth configuration, reconnect Twitch, and confirm both required scopes were granted.
-- YouTube clean audio incorrect: OBS track 2 must contain the clean/game mix; YouTube should use audio mode 2.
+- Music reaching YouTube or X: check how many audio tracks that stream is publishing before anything else. While both tracks arrive, those platforms are sent OBS track 2 and there is no setting to change, so music means track 2 in OBS is not the clean/game mix. While only one track arrives, they fall back to track 1 — the full mix — by default, and the fix is enabling track 2 in that user's OBS streaming output. Setting `music_fallback = 0` on the destination mutes it in that state instead, but does not repair the publisher.

@@ -32,14 +32,21 @@ The React/Vinext dashboard is a client-rendered control surface. It polls `/api/
 
 Each enabled destination has an independent worker. A worker reads the user’s MediaMTX path over internal RTSP and reconnects after failures.
 
-| Audio mode | Output behavior |
-| --- | --- |
-| 1 | Copy video and audio track 1 (music) |
-| 2 | Copy video and audio track 2 (clean/game) |
-| 3 | Twitch only: mix tracks 1+2 for live audio, retain track 2 as the VOD track |
-| 4 | Mix tracks 1+2 into one live audio track |
+Video and audio are always stream copies. Relay never mixes and never re-encodes audio, so OBS produces every mix: track 1 is the full live mix (music, game, voice) and track 2 is the clean mix (game and voice, no music). OBS may publish up to six tracks; the rest are carried through the SRT feed and simply never mapped to a destination. The mapping is derived from the platform and there is no user-facing audio setting:
 
-Modes 1 and 2 are stream copies. Modes 3 and 4 copy video but decode/mix/re-encode audio to AAC. YouTube uses FFmpeg’s tee muxer for primary and backup ingests. The worker redacts destination URLs from stored error messages.
+| Platform | Audio sent |
+| --- | --- |
+| Twitch | Track 1 as the live audio and track 2 as the separate VOD track |
+| YouTube | Track 2 only |
+| X | Track 2 only |
+| RPLAY | Track 1 only |
+| Custom RTMP | Track 1 only |
+
+Twitch is the only two-track output, and its Enhanced RTMP multitrack encapsulation is why the FFmpeg release is pinned in `router/Dockerfile`. Because referencing an audio stream the publisher is not sending fails the whole command, a publisher sending fewer than two audio tracks degrades to track 1 everywhere: Twitch, RPLAY, and custom take track 1 anyway, and YouTube and X take it too by default. Dropping the audio mapping for those two would emit FLV with no audio track at all, and neither ingest has been verified to accept that — a stream rejected on connect, or archived silent for a whole broadcast, is the worse and likelier failure. The consequence is accepted rather than hidden: track 1 is the music mix, Content ID scans the YouTube archive and X auto-publishes the replay, so the dashboard surfaces the degraded routing per destination and per stream, and a one-track publish is treated as an OBS misconfiguration for the broadcaster to repair. The per-destination `music_fallback` column is the opt-out — clearing it mutes that one YouTube or X destination instead of sending track 1. It defaults to on for those two platforms and is not offered anywhere else. A video-only publisher is forwarded with no audio mapping anywhere, instead of parking every destination on that stream in `retrying`. YouTube uses FFmpeg’s tee muxer for primary and backup ingests. The worker redacts destination URLs and embedded credentials from stored error messages.
+
+Twitch, RPLAY, and custom destinations therefore depend on track 1 already being the finished live mix. A music-only stem on track 1 is not a supported OBS layout.
+
+Each worker also reports `-progress` on stdout. A destination is only marked `forwarding` once FFmpeg reports it is producing output — bytes where the muxer counts them, frames and PTS where it does not, as with the tee muxer YouTube uses, and a worker whose progress stops while its process is still alive is killed and restarted.
 
 ## Program source states
 
@@ -48,6 +55,15 @@ Modes 1 and 2 are stream copies. Modes 3 and 4 copy video but decode/mix/re-enco
 - `starting_soon`: Relay activates the Starting Soon file and rejects/kicks the OBS publisher.
 
 Connection-loss failover is separate from manual takeover: while program mode is `live`, MediaMTX’s always-available file takes over when the SRT publisher disappears and yields when OBS reconnects.
+
+### Handoff latency
+
+MediaMTX offsets the first slate frame's timestamp by however long the publisher was gone, so detection time is re-presented to viewers as a freeze of the same length. Two settings control it:
+
+- `readTimeout` in `mediamtx.yml` is the SRT peer-idle timeout, i.e. how long a vanished publisher stays "connected".
+- Optional per-stream **fast handoff** drops a publisher that has stopped delivering bytes for `FAST_FAILOVER_STALL_SECONDS`, rather than waiting out that timeout. It is off by default because the threshold must stay above the negotiated SRT latency plus retransmission bursts.
+
+The screen encoder (`slate_encode_args`) reproduces the bitstream parameters of the stream each screen replaces, because a parameter-set change at the splice forces a decoder reconfiguration downstream. Those parameters are not fixed: `probe_contribution()` runs ffprobe against the live feed when a stream comes online and records resolution, frame rate, profile, level, reference frames, B-frames, pixel aspect, colour signalling, and the measured keyframe cadence for that stream. Until a stream has been seen, `DEFAULT_CONTRIBUTION` supplies platform-standard values including the two-second keyframe interval Twitch and YouTube both specify. B-frames are always disabled in the screen regardless of the feed, because they make PTS != DTS and the FLV muxer rejects that. MediaMTX reads the always-available file's parameter sets once, when the path is created, and the router then swaps the file underneath it, so every screen must come from the same recipe. Changing that recipe means bumping `SLATE_ENCODER_VERSION` and re-converting stored screens.
 
 ## Trust boundaries
 

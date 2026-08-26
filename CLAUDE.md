@@ -47,18 +47,29 @@ MediaMTX (UDP 8890 SRT in) → per-user path named by the stream slug → intern
 - `PathReconciler` — every 10s, PATCHes a MediaMTX path config per enabled user via the MediaMTX API so `alwaysAvailableFile` points at `/relay-data/media/<slug>/active.mp4`.
 - `TwitchIngestManager` — probes `ingest.twitch.tv/ingests` TCP-connect latency every 6h, stores the winner in `app_settings`, and validates that any candidate template is `rtmps://…live-video.net` with `{stream_key}`.
 - `WorkerManager` — one `asyncio.Task` per enabled destination, each running an FFmpeg retry loop.
-- `MediaConversionManager` — ffprobe-validates then re-encodes uploaded BRB/Starting Soon screens to the fixed failover format (1920x1080, fps 48, yuv420p, always with an audio track).
-- `FailoverAdManager` — 3s poll of every stream's MediaMTX online state; also the token-validation sweep and the BRB pre-staging.
+- `MediaConversionManager` — ffprobe-validates then re-encodes uploaded BRB/Starting Soon screens to match that stream's own probed contribution format (see `slate_encode_args`), always with two audio tracks.
+- `FailoverAdManager` — 3s poll of every stream's MediaMTX online state; also the token-validation sweep, the BRB pre-staging, the optional fast-handoff watchdog, and the contribution-format probe on the offline→online edge.
+- `SignalMetrics` — 1s poll of MediaMTX paths/srtconns/rtspsessions into per-stream ring buffers; the single shared snapshot every other caller reads.
 
 ### FFmpeg workers
 
-`WorkerManager._run` builds the destination URL **inside the worker**, after decrypting, and pins it for the worker's lifetime (`pinned_output_url`) — Twitch ingest selection must not change mid-broadcast. Platform base URLs are constants; a stored value already starting with `rtmp(s)://` is used verbatim. Video is always `-c:v copy`. Audio track 1 = music, 2 = clean/game:
+`WorkerManager._run` builds the destination URL **inside the worker**, after decrypting, and pins it for the worker's lifetime (`pinned_output_url`) — Twitch ingest selection must not change mid-broadcast. Platform base URLs are constants; a stored value already starting with `rtmp(s)://` is used verbatim. Every worker is a straight `-c copy` forward: the relay never mixes and never re-encodes, because OBS owns every mix. OBS track 1 is the full live mix (music + game + voice), track 2 is the clean mix (game + voice, no music), and tracks 3-6 ride along in the SRT feed but are never mapped.
 
-| `audio_track` | Behavior |
-| --- | --- |
-| 1 / 2 | Full stream copy of that track |
-| 3 | Twitch only: `amix` tracks 1+2 → AAC live, plus track 2 copied as the VOD track |
-| 4 | `amix` tracks 1+2 → single AAC live track |
+`build_audio_args(platform, audio_tracks, music_fallback=True)` derives the mapping from the platform alone — there is no `audio_track` request field and nothing reads the `audio_track` column (kept only because migrations preserve production rows):
+
+| platform | maps | why |
+| --- | --- | --- |
+| twitch | `0:a:0` + `0:a:1` | Enhanced RTMP multitrack: track 1 is the live audio, track 2 the separate VOD track |
+| youtube / x | `0:a:1` | the archive/replay is public, so no music |
+| rplay / custom | `0:a:0` | unpublished, so the full live mix is safe |
+
+Twitch's dual-track encapsulation needs the FFmpeg 8.x build pinned by `FFMPEG_RELEASE` in `router/Dockerfile`. `audio_tracks` comes from `audio_track_count()` and is `None` until the publisher's layout is known — a worker usually starts before OBS connects — which means "assume the documented two-track layout".
+
+A known count below 2 is the one place a user choice exists, and it is a safety choice, not a routing one. Referencing `0:a:1` against a publisher that is not sending it fails the whole command and parks every destination on that stream in `retrying`, so the mapping degrades to `0:a:0` on **every** platform, youtube and x included — unless that destination’s `music_fallback` is cleared, which drops the audio map entirely. Twitch/rplay/custom map track 1 anyway, so nothing is inverted there. For the clean-track platforms the degrade is a deliberate, informed trade: muting them means emitting FLV with no audio track at all, and that shape has never been verified against either ingest, so the alternative risks a stream the service rejects outright or archives silent — a worse and far likelier failure than one carrying the wrong mix. The cost is real and stated, not hidden: track 1 is the music mix, YouTube runs Content ID over the archive and X auto-publishes the replay, so a one-track publish puts music on two scanned destinations. A publisher sending one track is misconfigured whatever the flag says and has to be fixed either way, so the compensating control is the dashboard — the degraded routing is shown per destination and per stream, prominently, and weakening that display is what breaks this design. Do not restore fail-to-silence as the default.
+
+`destinations.music_fallback` (`INTEGER NOT NULL DEFAULT 1`) is now the mute switch rather than the music switch: it is on by default, and **clearing it is the explicit opt-out**. It is accepted on the create form and on `PATCH /api/destinations/{id}/music-fallback`; set to 0, that youtube or x destination stays connected and silent instead of taking the music mix. `validate_music_fallback` still rejects `True` on any platform other than youtube/x rather than storing a control that does nothing, but only a value the caller actually sent reaches it: `DestinationBody.music_fallback` is tri-state (`bool | None = None`) and `resolve_music_fallback` turns an omitted flag into the platform's own default — on for youtube/x, off elsewhere — so a twitch create that never mentioned the field does not 422 on the model default. The migration's `ADD COLUMN … DEFAULT 1` stamps 1 onto every pre-existing row, so an idempotent `UPDATE … WHERE music_fallback <> 0 AND platform NOT IN ('youtube','x')` runs right after the sweep; a stored 1 therefore only ever sits on a youtube or x row, never as a leftover on a destination that cannot act on it. The flag changes nothing when both tracks are present, and a video-only publisher (`0`) still gets no audio map anywhere. That route deliberately does not restart the worker — the map is fixed when FFmpeg starts, and a settings toggle must not drop a live output.
+
+Workers report `-progress` on stdout; stdout and stderr must be drained concurrently or FFmpeg deadlocks at 64 KiB. `forwarding` means FFmpeg is producing output, not that the process is alive — bytes where the muxer counts them, frames or PTS where it does not, since `total_size` is N/A for the tee muxer YouTube uses.
 
 YouTube uses the `tee` muxer with `-use_fifo` to hit primary and backup ingests. Every stderr line is stored as `last_error` only after replacing the output/backup URLs with `[destination]` — never let a real URL or key reach the DB, logs, or an API response.
 
@@ -69,7 +80,9 @@ Two distinct mechanisms, both fed by `active.mp4`:
 - **Failover** is automatic and passive: while program mode is `live`, MediaMTX's `alwaysAvailable` file covers a dropped SRT publisher and yields when OBS reconnects. `FailoverAdManager._prepare_brb` copies BRB over `active.mp4` while OBS is online so the file is staged before a drop.
 - **Manual takeover** (`PATCH /api/screens/mode` → `brb`/`starting_soon`) copies that screen over `active.mp4`, sets program mode, and calls `kick_stream_publishers`. Because `mediamtx_auth` requires program mode `live` to authorize a publish, OBS stays locked out until the user returns to live input.
 
-`active.mp4` is always swapped by writing `.pending.mp4` and `os.replace` so MediaMTX never reads a torn file. New users are seeded from `media/_default/brb.mp4`, itself copied from the first available (owner-first) uploaded BRB.
+`active.mp4` is always swapped by writing `.pending.mp4` and `os.replace` so MediaMTX never reads a torn file; the swap runs off the event loop and prefers `os.link` over a copy. New users are seeded from `media/_default/brb.mp4`, itself copied from the first available (owner-first) uploaded BRB, or from a generated placeholder slate when nothing has been uploaded yet — MediaMTX opens `alwaysAvailableFile` at config load, so that file must exist before the media server starts.
+
+MediaMTX reads the always-available file's SPS/PPS and AudioSpecificConfig once, when the path is created, and then plays samples from whatever file is at that path. Every screen must therefore be produced by `slate_encode_args(profile)` where `profile` is that stream's own observed contribution format — resolution, frame rate, profile/level, refs, B-frames, pixel aspect, colour signalling, and measured keyframe cadence. `probe_contribution()` reads those from the live feed with ffprobe on the offline→online edge and stores them per stream; `contribution_fingerprint()` marks screens stale when the feed changes shape. Nothing in this path may be hard-coded to one operator's encoder — this is a multi-tenant deployment. Replacing `active.mp4` does not reach viewers until the path is recreated — `reload_fallback_path` does that, but only while the path is idle, otherwise the change is staged for the next reconnect.
 
 ### Dashboard
 

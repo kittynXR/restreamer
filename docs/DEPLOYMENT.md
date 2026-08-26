@@ -8,7 +8,7 @@
 - UDP 8890 (or the configured `SRT_PORT`) open to OBS publishers.
 - A Caddy container attached to a shared external Docker network. The default network name is `caddy`; set `PROXY_NETWORK` if yours differs.
 
-The cheapest VPS tiers are sufficient for ordinary video-copy forwarding. Audio-mix modes consume some CPU. Video cropping/scaling/transcoding is intentionally not part of the initial horizontal forwarding path.
+The cheapest VPS tiers are sufficient. Forwarding is a pure stream copy of both video and audio, so a destination costs little more than its bandwidth. Video cropping/scaling/transcoding is intentionally not part of the initial horizontal forwarding path.
 
 ## Install
 

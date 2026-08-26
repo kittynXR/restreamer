@@ -30,6 +30,21 @@ h1,h2,p { margin-top:0; } h1 { margin-bottom:0; font-size:clamp(28px,3vw,39px); 
 .nav-button { width:100%; border:0; background:transparent; text-align:left; }.logout { margin-left:auto; border:0; background:transparent; color:#8ea49a; padding:6px; font-size:11px; }.logout:hover { color:#fff; }
 .signal.fallback { color:#8a5b13; border-color:#ead5ad; background:#fff7e8; }.signal.fallback span,.status-dot.amber { background:#e6a83a; box-shadow:0 0 0 4px rgba(230,168,58,.13); }
 .notice { margin-top:18px; padding:12px 14px; border-radius:10px; display:flex; justify-content:space-between; align-items:center; font-size:13px; }.error-notice { background:#fff0f0; border:1px solid #efc9c9; color:#8e3030; }.notice button { border:0; background:transparent; color:inherit; font-weight:700; }
+/* One-track publish alert. Louder than .notice on purpose: it is the only thing
+   standing between "OBS is misconfigured" and a music mix landing in an archive
+   that scans it, so it gets a full panel at the top of the page rather than a
+   line of muted hint text. The five colours are declared as locals here and
+   redeclared in the OLED block — nothing else in the file needs them. */
+.track-alert { --alert-face:#fff8ea; --alert-line:#e8d3a8; --alert-edge:#dc9b32; --alert-ink:#2b1d05; --alert-text:#7a5620; --alert-quiet:#9a7c4c; margin-top:18px; padding:15px 17px; display:flex; gap:13px; align-items:flex-start; border:1px solid var(--alert-line); border-left:4px solid var(--alert-edge); border-radius:12px; background:var(--alert-face); color:var(--alert-text); }
+/* Music actually reaching a scanned archive escalates from caution to error. */
+.track-alert.music { --alert-face:#fff0f0; --alert-line:#efc9c9; --alert-edge:#c8434b; --alert-ink:#fff; --alert-text:#8e3030; --alert-quiet:#a86a6a; }
+.track-alert-mark { flex:0 0 24px; height:24px; display:grid; place-items:center; border-radius:50%; background:var(--alert-edge); color:var(--alert-ink); font-size:14px; font-weight:850; }
+.track-alert-body { min-width:0; }
+.track-alert strong { display:block; font-size:15px; letter-spacing:-.015em; }
+.track-alert p { margin:7px 0 0; font-size:13px; line-height:1.55; }
+.track-alert b { font-weight:750; }
+.track-alert-fix { margin-top:10px; padding-top:9px; border-top:1px solid var(--alert-line); }
+.track-alert-note { color:var(--alert-quiet); font-size:12px; }
 .preview-card iframe { width:100%; aspect-ratio:16/7.8; border:0; display:block; background:#0c1713; }.preview.offline { background:radial-gradient(circle at 80% 20%,rgba(230,168,58,.14),transparent 35%),linear-gradient(135deg,#23322c,#101714 75%); }.backup-pill { font-size:10px; letter-spacing:.12em; font-weight:750; border-radius:999px; background:#d99a32; padding:5px 8px; }
 .route-status.pending { color:#8a5b13; }.route-status.pending span { background:#e6a83a; }.empty-state { margin-top:18px; min-height:160px; border:1px dashed #c9d6cf; border-radius:12px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:7px; color:var(--muted); text-align:center; }.empty-state strong { color:var(--ink); }.empty-state span { font-size:13px; }.empty-state button { margin-top:8px; border:0; background:var(--green); color:#fff; border-radius:9px; padding:10px 14px; font-weight:700; }
 .center-screen { min-height:100vh; display:grid; place-content:center; justify-items:center; gap:12px; color:var(--muted); }.loader { width:30px; height:30px; border:3px solid #d8e4dd; border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite; }@keyframes spin{to{transform:rotate(360deg)}}
@@ -225,3 +240,166 @@ button:disabled,.button-link[aria-disabled="true"] { cursor:not-allowed; opacity
   .tour-panel { min-height:390px; }
   .tour-platforms { grid-template-columns:1fr; }
 }
+
+/* Stream health */
+.metrics-grid { margin-top:20px; display:grid; grid-template-columns:minmax(0,1.15fr) minmax(0,1fr); gap:20px; }
+.metrics-card { display:flex; flex-direction:column; }
+.metric-row { margin-top:18px; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; }
+.metric { min-width:0; padding:11px 12px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+.metric span { display:block; color:var(--muted); font-size:9px; font-weight:800; letter-spacing:.11em; }
+.metric strong { display:block; margin-top:6px; overflow:hidden; color:#dff8e9; font-family:var(--font-geist-mono),monospace; font-size:15px; text-overflow:ellipsis; white-space:nowrap; }
+.metric small { display:block; margin-top:3px; color:var(--muted); font-size:10px; }
+.spark-row { margin-top:12px; display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.spark-cell { min-width:0; padding:9px 11px 6px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+.spark-cell>span { display:block; margin-bottom:4px; color:var(--muted); font-size:9px; font-weight:800; letter-spacing:.11em; text-transform:uppercase; }
+.spark { display:block; width:100%; height:30px; }
+.spark-line { fill:none; stroke:var(--green); stroke-width:1.5; stroke-linejoin:round; }
+.spark-area { fill:rgba(53,220,138,.10); stroke:none; }
+.spark.amber .spark-line { stroke:#e6a83a; }
+.spark.amber .spark-area { fill:rgba(230,168,58,.10); }
+/* Stands in for the line when there is nothing measured to draw. Keeps the
+   cell's height so rows do not jump once samples arrive, and stays a dash
+   rather than a flat line so it cannot be read as a rate of zero. */
+.spark-empty { display:flex; align-items:center; justify-content:center; color:var(--muted); font-family:var(--font-geist-mono),monospace; font-size:11px; }
+.metric-list { margin:14px 0 0; display:grid; grid-template-columns:1fr 1fr; gap:2px 18px; }
+.metric-list div { display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px solid #171e1b; }
+.metric-list dt { color:var(--muted); font-size:11px; }
+.metric-list dd { margin:0; color:#cbd7d0; font-family:var(--font-geist-mono),monospace; font-size:11px; }
+.metric-caption { margin:14px 0 0; padding-top:12px; border-top:1px solid var(--line); color:var(--muted); font-size:11px; line-height:1.5; }
+.metric-empty { margin-top:18px; padding:22px; border:1px dashed #2b3530; border-radius:12px; color:var(--muted); font-size:12px; text-align:center; }
+.output-list { margin-top:18px; display:grid; gap:8px; }
+.output-row { min-height:56px; padding:9px 12px; display:grid; grid-template-columns:32px minmax(80px,1fr) auto 120px auto; align-items:center; gap:11px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+.output-row .platform-icon { width:32px; height:32px; }
+.output-row .platform-icon img { width:18px; height:18px; }
+.output-identity { min-width:0; }
+.output-identity strong { display:block; overflow:hidden; font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+.output-identity .route-status { margin-top:3px; font-size:10px; }
+.output-numbers { text-align:right; }
+.output-numbers b { display:block; color:#dff8e9; font-family:var(--font-geist-mono),monospace; font-size:13px; font-weight:600; }
+.output-numbers span { display:block; margin-top:2px; color:var(--muted); font-family:var(--font-geist-mono),monospace; font-size:10px; }
+.output-numbers span.warn { color:#f0bd62; }
+/* Words standing in for a rate ("Measuring…", "Not reported") are not a
+   reading, so they must not wear the bright numeral colour that says one is
+   present. */
+.output-numbers b.quiet { color:var(--muted); font-size:11px; font-weight:600; }
+.output-row .spark { height:24px; }
+.restart-badge { justify-self:end; color:var(--muted); font-size:10px; font-family:var(--font-geist-mono),monospace; }
+.route-status.failed { color:#ff9fa6; }
+.route-status.failed span { background:#e9606a; }
+.route-status.pending { color:#f0bd62; }
+.route-status.pending span { background:#e6a83a; }
+.destination-row { grid-template-columns:42px minmax(150px,1fr) 130px auto; }
+.destination-actions { display:flex; align-items:center; gap:12px; }
+.destination-error { grid-column:2 / -1; margin:0 0 12px; max-height:3.9em; overflow:auto; overflow-wrap:anywhere; color:#ff9fa6; font-size:11px; line-height:1.45; }
+.fast-failover { width:100%; margin-top:20px; padding:11px 12px; display:flex; align-items:center; justify-content:space-between; gap:12px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+.fast-failover strong { display:block; font-size:12px; }
+.fast-failover span { display:block; margin-top:3px; color:var(--muted); font-size:10px; line-height:1.4; }
+.protection-state.unavailable { color:#f0bd62; }
+.protection-state.unavailable span { background:#e6a83a; box-shadow:0 0 0 4px rgba(230,168,58,.11); }
+.stale-notice { border:1px solid #4a3515; background:#1b1205; color:#f0bd62; }
+.auth-notice { margin:0 0 18px; padding:11px 12px; border-left:3px solid #286747; border-radius:7px; background:#05110b; color:#8ea49a; font-size:12px; line-height:1.5; }
+/* Audio routing: a reference card, so nothing in here is interactive. */
+.audio-routing { margin-top:20px; padding:24px; border:1px solid var(--line); border-radius:16px; background:var(--card); box-shadow:0 18px 60px rgba(0,0,0,.42),inset 0 1px rgba(255,255,255,.018); scroll-margin-top:20px; }
+.audio-copy { margin:11px 0 18px; color:var(--muted); font-size:13px; line-height:1.5; }
+.audio-contract { display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+.audio-contract>div { padding:12px 13px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+.audio-contract b { display:block; font-size:12px; }
+.audio-contract span { display:block; margin-top:4px; color:var(--muted); font-size:11px; line-height:1.45; }
+.audio-table-wrap { margin-top:14px; overflow-x:auto; }
+.audio-table { width:100%; border-collapse:collapse; font-size:12px; text-align:left; }
+.audio-table thead th { padding:0 14px 8px 0; color:var(--muted); font-size:9px; font-weight:800; letter-spacing:.11em; text-transform:uppercase; }
+.audio-table tbody th,.audio-table td { padding:11px 14px 11px 0; border-top:1px solid #171e1b; vertical-align:middle; font-weight:inherit; }
+.audio-table td:last-child { padding-right:0; color:var(--muted); line-height:1.45; }
+.audio-platform { display:flex; align-items:center; gap:10px; font-weight:650; white-space:nowrap; }
+.audio-platform .platform-icon { width:28px; height:28px; flex:0 0 28px; }
+.audio-platform .platform-icon img { width:16px; height:16px; }
+.audio-maps { color:#dff8e9; font-family:var(--font-geist-mono),monospace; white-space:nowrap; }
+.audio-note { margin:14px 0 0; padding-top:12px; border-top:1px solid var(--line); color:var(--muted); font-size:11px; line-height:1.5; }
+.audio-note.warn { color:#f0bd62; }
+.audio-preset { padding:12px 13px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+.audio-preset span { display:block; color:var(--muted); font-size:9px; font-weight:800; letter-spacing:.11em; }
+.audio-preset strong { display:block; margin-top:6px; font-size:12px; }
+.audio-preset small { display:block; margin-top:5px; color:var(--muted); font-size:11px; line-height:1.45; }
+
+/* Focus is otherwise invisible on every control that is not a text input. */
+:where(button,a,[role="switch"],.nav-item,.upload-button):focus-visible { outline:2px solid #35dc8a; outline-offset:2px; }
+.upload-button:focus-within { border-color:#35dc8a; }
+.owner-lock { color:var(--muted); }
+
+@media(max-width:1080px){ .metrics-grid { grid-template-columns:1fr; } }
+@media(max-width:640px){
+  .metric-row { grid-template-columns:1fr 1fr; }
+  .metric-list { grid-template-columns:1fr; }
+  .audio-contract { grid-template-columns:1fr; }
+  /* Let the routing table scroll inside its own wrapper rather than crushing
+     four columns into a phone width. */
+  .audio-table { min-width:620px; }
+  .output-row { grid-template-columns:32px minmax(0,1fr) auto auto; }
+  .output-row .spark { display:none; }
+}
+@media(max-width:570px){
+  /* Colour alone must not carry on-air status. */
+  .signal { font-size:11px; padding:9px 12px; }
+  .audio-routing { padding:19px; }
+  .destination-row { grid-template-columns:40px 1fr auto; }
+  .destination-actions { gap:9px; }
+  /* The base stylesheet hides .route-status at this width; the health panel is
+     where per-destination state actually lives, so keep it there. */
+  .output-identity .route-status { display:flex; }
+}
+
+/* Audio fallback: what YouTube and X do when the clean track never arrives.
+   The only audio setting in the product, so it is styled as two named outcomes
+   rather than a switch — "on" and "off" say nothing about what reaches an
+   archive, and the whole failure this control prevents is a wrong belief about
+   what is being published. */
+.audio-degrade-rule { margin:12px 0 0; padding:11px 12px; border-left:3px solid #4a3515; border-radius:7px; background:#120c04; color:#c3a97b; font-size:12px; line-height:1.55; }
+/* "Why" used to be the last column and inherited its muting from td:last-child.
+   The degrade column took that slot, so it needs its own rule now. */
+.audio-table td.audio-why { color:var(--muted); line-height:1.45; }
+.audio-table td.audio-degrade { color:#a9b4ae; }
+/* The two platforms where this is a choice, not a fixed consequence. */
+.audio-table td.audio-degrade.choice { color:#f0bd62; }
+.destination-audio.degraded { color:#f0bd62; }
+/* Music actually leaving for a scanned archive is the one state that earns the
+   error colour: nothing is broken, but it is the outcome to notice first. */
+.destination-audio.risk { color:#ff9fa6; }
+
+/* OLED half of the one-track alert. Only the locals change — every structural
+   rule lives with the light base next to .notice. */
+.track-alert { --alert-face:#150d02; --alert-line:#4a3515; --alert-edge:#e6a83a; --alert-ink:#171002; --alert-text:#f5cd88; --alert-quiet:#bda172; box-shadow:0 18px 60px rgba(0,0,0,.42); }
+.track-alert.music { --alert-face:#180608; --alert-line:#562126; --alert-edge:#e9606a; --alert-ink:#1a0608; --alert-text:#ffb3b8; --alert-quiet:#c98d92; }
+
+.fallback-choice { min-width:0; margin:0; padding:12px 13px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+/* Only while OBS is actually sending one track. Track 1 is the default now, so
+   painting every YouTube and X card amber forever would train the operator to
+   ignore the exact colour that has to mean something during a degrade. */
+.fallback-choice.degraded { border-color:#4a3515; background:#120c04; }
+.fallback-choice.risk { border-color:#562126; background:#1a080a; }
+/* Spans the row rather than squeezing into the 130px status column, so the
+   consequence sentence stays readable at any width. */
+.destination-row .fallback-choice { grid-column:2 / -1; margin-bottom:14px; }
+/* Floated so it lays out as a plain block label instead of punching a gap in
+   the fieldset's top border, which no other card in the dashboard does. */
+.fallback-choice legend { float:left; width:100%; margin-bottom:9px; padding:0; color:var(--muted); font-size:9px; font-weight:800; letter-spacing:.11em; text-transform:uppercase; }
+.fallback-options { clear:both; display:flex; flex-wrap:wrap; gap:8px; }
+/* Outspecify `.modal label` and `.modal input`, which otherwise turn these into
+   full-width stacked form fields inside the Add destination dialog. */
+.fallback-choice .fallback-options label { position:relative; display:block; margin:0; }
+.fallback-choice .fallback-options input { position:absolute; width:1px; height:1px; margin:0; padding:0; border:0; opacity:0; }
+.fallback-options label span { display:block; padding:8px 12px; border:1px solid #2d3933; border-radius:999px; background:#0c110e; color:#a9b4ae; font-size:12px; font-weight:650; cursor:pointer; transition:.16s ease; }
+.fallback-options label:hover span { border-color:#4c5b53; color:#dce7e1; }
+.fallback-options label.chosen span { border-color:#168655; background:#082719; color:#62f1a6; }
+/* During a degrade the chosen pill stops reading as "saved" and starts reading
+   as "this is what is being decided right now". */
+.fallback-choice.degraded .fallback-options label.chosen span { border-color:#8a6420; background:#231705; color:#f0bd62; }
+.fallback-choice.risk .fallback-options label.chosen span { border-color:#8e3f45; background:#2a0d10; color:#ffb3b8; }
+/* The input carries focus but is invisible, so the pill has to show it. */
+.fallback-options input:focus-visible + span { outline:2px solid #35dc8a; outline-offset:2px; }
+.fallback-choice:disabled { opacity:.55; }
+.fallback-choice:disabled .fallback-options label span { cursor:wait; }
+.fallback-consequence { margin:10px 0 0; color:var(--muted); font-size:11px; line-height:1.5; }
+.fallback-live { margin:7px 0 0; color:#f0bd62; font-size:11px; font-weight:650; line-height:1.5; }
+.fallback-choice.risk .fallback-live { color:#ffb3b8; }
+.fallback-timing { margin:7px 0 0; color:#7e8b85; font-size:11px; line-height:1.5; }
+.fallback-confirm { border-color:#4a3515; background:#120c04; }

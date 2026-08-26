@@ -1,6 +1,17 @@
 logLevel: info
 logDestinations: [stdout]
-readTimeout: 5s
+# Also the SRT peer-idle timeout, so this is how long a vanished OBS publisher
+# stays "connected" before the failover file takes over — and MediaMTX adds that
+# whole dead interval to the first slate frame's timestamp, so viewers see it as
+# a freeze of the same length. Keep it comfortably above the negotiated SRT
+# latency (500 ms in the generated OBS URL) plus retransmission bursts; below
+# about 1.5 s a lossy uplink starts getting dropped mid-broadcast.
+#
+# It also bounds the /internal/mediamtx-auth call to the router, so it must stay
+# above the router's worst-case response time or a publish gets rejected outright
+# — which is why this is 3s rather than the 2s the failover budget alone wants.
+# Per-stream "fast handoff" is the safer lever for cutting detection further.
+readTimeout: 3s
 writeTimeout: 10s
 
 authMethod: http

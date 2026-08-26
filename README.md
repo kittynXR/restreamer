@@ -1,6 +1,6 @@
 # Relay Restreamer
 
-Relay is a self-hosted, multi-user restreaming control plane for a VPS. OBS sends one SRT feed to the VPS; Relay forwards it to Twitch, YouTube, RPLAY, X, or a custom RTMP destination. Video is copied whenever possible, so ordinary forwarding is inexpensive. Audio is selected or mixed per destination.
+Relay is a self-hosted, multi-user restreaming control plane for a VPS. OBS sends one SRT feed to the VPS; Relay forwards it to Twitch, YouTube, RPLAY, X, or a custom RTMP destination. Video is copied whenever possible, so ordinary forwarding is inexpensive. Audio is never mixed or re-encoded: OBS supplies a full live mix on track 1 and a clean mix on track 2, and each platform's routing follows from that.
 
 The project includes an OLED dashboard, per-user OBS credentials, destination toggles with confirmation, browser monitoring, BRB/Starting Soon uploads, connection-loss failover, Twitch VOD-track handling, team invitations, automatic Twitch ingest selection, and optional Twitch outage ads.
 
@@ -9,7 +9,7 @@ The project includes an OLED dashboard, per-user OBS credentials, destination to
 ```text
 OBS --SRT/UDP--> MediaMTX --RTSP--> per-destination FFmpeg --> Twitch / YouTube / RPLAY / X
                          |                    |
-                         |                    +-- video copy; audio copy or mix
+                         |                    +-- video copy; audio copy (track 1 and/or 2)
                          +-- HLS monitor
 
 Browser --HTTPS--> Caddy --> dashboard + FastAPI router --> SQLite + encrypted secrets

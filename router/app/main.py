@@ -4,8 +4,10 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import math
 import os
+import random
 import re
 import secrets
 import shutil
@@ -13,10 +15,11 @@ import sqlite3
 import ssl
 import statistics
 import time
+from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 from urllib.parse import quote, urlencode, urlparse
 
 import httpx
@@ -60,15 +63,108 @@ TWITCH_VALIDATE_URL = "https://id.twitch.tv/oauth2/validate"
 TWITCH_API = "https://api.twitch.tv/helix"
 FAILOVER_GRACE_SECONDS = 60
 MEDIA_MAX_BYTES = 2 * 1024 * 1024 * 1024
-MEDIA_MAX_DURATION_SECONDS = 30 * 60
+# Every takeover parses this file's moov atom once per track before the first
+# slate frame reaches a viewer, so the cap is a handoff-latency budget, not just
+# a disk limit. Shorter screens hand off faster; 30 seconds is ideal for BRB.
+MEDIA_MAX_DURATION_SECONDS = 5 * 60
 INVITE_DEFAULT_DAYS = 7
 INVITE_MAX_DAYS = 30
+
+# The failover slate must reproduce the contribution encoder's bitstream
+# parameters, because MediaMTX reads SPS/PPS and AudioSpecificConfig once when
+# the path is created and then swaps samples underneath. Any divergence forces a
+# decoder reconfiguration on the viewer at the exact moment of the handoff.
+SLATE_VIDEO_BITRATE = "3000k"
+SLATE_AUDIO_BITRATE = "160k"
+# Bump whenever the slate recipe below changes so stored screens can be
+# recognised as stale and re-converted.
+SLATE_ENCODER_VERSION = 3
+
+# A failover screen only hands off cleanly when it reproduces the bitstream
+# parameters of the stream it replaces, so the recipe is derived per stream from
+# that user's own feed rather than fixed to one encoder. These defaults apply
+# until a stream has been observed; two seconds is the keyframe interval both
+# Twitch and YouTube specify.
+DEFAULT_CONTRIBUTION: dict[str, Any] = {
+    "width": 1920,
+    "height": 1080,
+    "fps": 60.0,
+    "gop_seconds": 2.0,
+    "profile": "high",
+    "level": 42,
+    "refs": 1,
+    "bframes": 0,
+    "sar": "1/1",
+    "color_primaries": "bt709",
+    "color_trc": "bt709",
+    "colorspace": "bt709",
+    "color_range": "tv",
+}
+CONTRIBUTION_FPS_RANGE = (10.0, 120.0)
+CONTRIBUTION_PROBE_SECONDS = 4
+# ffprobe reports human-readable profile names ("High 4:2:2 Predictive") that are
+# not valid libx264 profile arguments, so probed values are mapped to the set
+# x264 accepts and anything unrecognised falls back to high.
+X264_PROFILES = {
+    "baseline": "baseline", "constrainedbaseline": "baseline",
+    "main": "main", "high": "high",
+    "high10": "high10", "high10intra": "high10",
+    "high422": "high422", "high422intra": "high422", "high422predictive": "high422",
+    "high444": "high444", "high444predictive": "high444", "high444intra": "high444",
+}
+
+# Metrics sampling. One MediaMTX snapshot per tick is shared by every stream.
+METRICS_INTERVAL_SECONDS = 1.0
+METRICS_SIGNAL_SAMPLES = 240
+METRICS_OUTPUT_SAMPLES = 120
+METRICS_SERIES_POINTS = 40
+# Lookback for the derived per-destination output rate, and the shortest span
+# we will still answer from while a worker is warming up. See
+# derive_output_rate for why this is seconds and not one -progress block.
+METRICS_OUTPUT_RATE_WINDOW_S = 4.0
+METRICS_OUTPUT_RATE_MIN_SPAN_S = 2.0
+
+# Fast failover watchdog. Opt-in per stream: when the publisher is online but has
+# delivered no bytes for this long, drop it so the slate can take over instead of
+# waiting out MediaMTX's peer-idle timeout. Must stay comfortably above the
+# negotiated SRT latency (500 ms) plus retransmission bursts.
+FAST_FAILOVER_STALL_SECONDS = 2.0
+
+WORKER_RETRY_MIN_SECONDS = 0.5
+WORKER_RETRY_MAX_SECONDS = 30.0
+WORKER_HEALTHY_SECONDS = 30.0
+WORKER_STALL_SECONDS = 20.0
+WORKER_ERROR_LINES = 20
 TWITCH_FALLBACK = {
     "name": "US West (Oregon)",
     "url_template_secure": "rtmps://usw20.contribute.live-video.net/app/{stream_key}",
     "latency_ms": None,
     "checked_at": None,
 }
+
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+# The metrics sampler makes three MediaMTX calls a second; at INFO that is a
+# quarter of a million log lines a day and it buries anything real.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+log = logging.getLogger("relay")
+
+# Matches "scheme://user:password@host" so RTSP/RTMP credentials can never reach
+# the database, an API response, or the container log.
+CREDENTIAL_RE = re.compile(r"(?<=://)[^/@\s]+:[^/@\s]+(?=@)")
+
+
+def redact(text: str, *urls: str | None) -> str:
+    """Strip destination URLs and any embedded credentials from FFmpeg output."""
+    cleaned = text
+    for url in urls:
+        if url:
+            cleaned = cleaned.replace(url, "[destination]")
+    return CREDENTIAL_RE.sub("[redacted]", cleaned)
 
 
 def now() -> str:
@@ -119,6 +215,7 @@ def initialize_db() -> None:
                 platform TEXT NOT NULL,
                 output_url_enc TEXT NOT NULL,
                 audio_track INTEGER NOT NULL DEFAULT 1,
+                music_fallback INTEGER NOT NULL DEFAULT 1,
                 enabled INTEGER NOT NULL DEFAULT 0,
                 state TEXT NOT NULL DEFAULT 'off',
                 last_error TEXT,
@@ -180,9 +277,43 @@ def initialize_db() -> None:
             PRAGMA optimize;
             """
         )
-        user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-        if "enabled" not in user_columns:
-            conn.execute("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        # CREATE TABLE IF NOT EXISTS cannot add a column to a table that already
+        # exists, so every column added after the first release must be listed
+        # here. The sweep is idempotent and preserves production rows.
+        added_columns = {
+            "users": {"enabled": "INTEGER NOT NULL DEFAULT 1"},
+            "destinations": {
+                "restart_count": "INTEGER NOT NULL DEFAULT 0",
+                "last_started_at": "TEXT",
+                # Defaults to 1, matching the create default: a one-track
+                # publish sends track 1 to YouTube and X rather than an FLV
+                # stream with no audio track at all, which is unverified
+                # against both ingests. The normalisation below then clears the
+                # flag on the platforms that map track 1 whatever it says.
+                "music_fallback": "INTEGER NOT NULL DEFAULT 1",
+            },
+            "media_assets": {
+                "encoder_version": "INTEGER NOT NULL DEFAULT 0",  # legacy, superseded
+                "encoder_fingerprint": "TEXT",
+            },
+        }
+        for table, columns in added_columns.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for column, ddl in columns.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                    log.info("migrated %s: added column %s", table, column)
+        # ADD COLUMN stamps the new default onto every existing row, including
+        # the platforms that map track 1 whatever this flag says. Clearing it
+        # there preserves the column's one invariant — a stored 1 is a real
+        # YouTube or X opt-in, never a leftover on a destination that cannot act
+        # on it — which is what validate_music_fallback enforces on the way in
+        # and what the dashboard reads back. Idempotent: it only ever touches
+        # rows that already violate the invariant.
+        conn.execute(
+            "UPDATE destinations SET music_fallback = 0 "
+            "WHERE music_fallback <> 0 AND platform NOT IN ('youtube', 'x')"
+        )
         conn.execute(
             "UPDATE media_assets SET status = 'error', message = 'Conversion was interrupted; upload the file again.' WHERE status = 'converting'"
         )
@@ -291,10 +422,23 @@ class DestinationBody(BaseModel):
     name: str = Field(min_length=1, max_length=60)
     platform: str = Field(pattern=r"^(twitch|youtube|rplay|x|custom)$")
     output_url: str = Field(min_length=12, max_length=2000)
-    audio_track: int = Field(ge=1, le=4)
+    # Tri-state on purpose. None is "the caller made no choice", which is every
+    # platform whose form never shows the control; a plain `bool = True` would
+    # push True into validate_music_fallback on a Twitch create and 422 a field
+    # the user never set. resolve_music_fallback() turns None into the
+    # platform's own default.
+    music_fallback: bool | None = None
+
+
+class MusicFallbackBody(BaseModel):
+    enabled: bool
 
 
 class ToggleBody(BaseModel):
+    enabled: bool
+
+
+class FastFailoverBody(BaseModel):
     enabled: bool
 
 
@@ -387,21 +531,24 @@ class TwitchIngestManager:
                 (json.dumps(selection), now()),
             )
 
-    async def start(self) -> None:
+    async def start(self, probe_now: bool = True) -> None:
         self.load_saved()
-        try:
-            await self.refresh()
-        except Exception:
-            pass
-        self.task = asyncio.create_task(self._refresh_loop())
-
-    async def _refresh_loop(self) -> None:
-        while True:
-            await asyncio.sleep(TWITCH_REFRESH_SECONDS)
+        if probe_now:
             try:
                 await self.refresh()
             except Exception:
                 pass
+        self.task = asyncio.create_task(self._refresh_loop(immediate=not probe_now))
+
+    async def _refresh_loop(self, immediate: bool = False) -> None:
+        if not immediate:
+            await asyncio.sleep(TWITCH_REFRESH_SECONDS)
+        while True:
+            try:
+                await self.refresh()
+            except Exception as exc:
+                log.warning("Twitch ingest refresh failed: %s", exc)
+            await asyncio.sleep(TWITCH_REFRESH_SECONDS)
 
     async def shutdown(self) -> None:
         if self.task:
@@ -590,6 +737,28 @@ def set_program_mode(stream_id: int, mode: str) -> None:
             (program_mode_key(stream_id), mode, now()),
         )
 
+def fast_failover_key(stream_id: int) -> str:
+    return f"fast_failover:{stream_id}"
+
+
+def fast_failover_enabled(stream_id: int) -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (fast_failover_key(stream_id),),
+        ).fetchone()
+    return bool(row and row["value"] == "1")
+
+
+def set_fast_failover(stream_id: int, enabled: bool) -> None:
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO app_settings(key, value, updated_at) VALUES(?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+            (fast_failover_key(stream_id), "1" if enabled else "0", now()),
+        )
+
+
 def stream_media_dir(slug: str) -> Path:
     path = DB_PATH.parent / "media" / slug
     path.mkdir(parents=True, exist_ok=True)
@@ -602,6 +771,293 @@ def media_asset_path(slug: str, kind: str) -> Path:
 
 def active_media_path(slug: str) -> Path:
     return stream_media_dir(slug) / "active.mp4"
+
+
+def contribution_key(stream_id: int) -> str:
+    return f"contribution:{stream_id}"
+
+
+def contribution_profile(stream_id: int) -> dict[str, Any]:
+    """The observed bitstream parameters of this stream's contribution feed."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?", (contribution_key(stream_id),)
+        ).fetchone()
+    profile = dict(DEFAULT_CONTRIBUTION)
+    if row:
+        try:
+            stored = json.loads(row["value"])
+            if isinstance(stored, dict):
+                profile.update({k: v for k, v in stored.items() if k in DEFAULT_CONTRIBUTION})
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return profile
+
+
+def contribution_fingerprint(profile: dict[str, Any]) -> str:
+    """Identifies the recipe a screen was encoded for.
+
+    A screen stays valid only while the feed it has to match is unchanged, so the
+    fingerprint covers the profile as well as the encoder version.
+    """
+    payload = json.dumps(
+        {k: profile.get(k) for k in sorted(DEFAULT_CONTRIBUTION)}, separators=(",", ":")
+    )
+    return f"{SLATE_ENCODER_VERSION}:{hashlib.sha256(payload.encode()).hexdigest()[:12]}"
+
+
+def _parse_rate(value: Any) -> float | None:
+    try:
+        if isinstance(value, str) and "/" in value:
+            num, _, den = value.partition("/")
+            return float(num) / float(den) if float(den) else None
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+async def probe_contribution(slug: str) -> dict[str, Any] | None:
+    """Read the live feed's actual encoding parameters.
+
+    Everything here comes out of the bitstream itself, so it works for any
+    encoder a streamer happens to use rather than assuming one setup.
+    """
+    source = (
+        f"rtsp://{quote(MEDIA_INTERNAL_USER, safe='')}:{quote(MEDIA_INTERNAL_PASS, safe='')}"
+        f"@{MEDIAMTX_RTSP}/{slug}"
+    )
+    command = [
+        "ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+        "-select_streams", "v:0",
+        "-show_entries",
+        "stream=width,height,profile,level,refs,has_b_frames,avg_frame_rate,r_frame_rate,"
+        "sample_aspect_ratio,color_primaries,color_transfer,color_space,color_range",
+        "-show_entries", "frame=key_frame",
+        "-read_intervals", f"%+{CONTRIBUTION_PROBE_SECONDS}",
+        "-of", "json", source,
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=CONTRIBUTION_PROBE_SECONDS + 15
+        )
+    except (asyncio.TimeoutError, OSError) as exc:
+        log.warning("contribution probe failed for %s: %s", slug, exc)
+        return None
+    if process.returncode:
+        log.warning(
+            "contribution probe failed for %s: %s",
+            slug,
+            redact(stderr.decode(errors="replace").strip()[:200]),
+        )
+        return None
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    streams = payload.get("streams") or []
+    if not streams:
+        return None
+    video = streams[0]
+
+    profile = dict(DEFAULT_CONTRIBUTION)
+    if video.get("width") and video.get("height"):
+        profile["width"] = int(video["width"])
+        profile["height"] = int(video["height"])
+    fps = _parse_rate(video.get("avg_frame_rate")) or _parse_rate(video.get("r_frame_rate"))
+    if fps and CONTRIBUTION_FPS_RANGE[0] <= fps <= CONTRIBUTION_FPS_RANGE[1]:
+        profile["fps"] = round(fps, 3)
+    named = video.get("profile")
+    if isinstance(named, str):
+        key = named.lower().replace(" ", "").replace(":", "")
+        if key not in X264_PROFILES:
+            log.info("unmapped H.264 profile %r for %s; using high", named, slug)
+        profile["profile"] = X264_PROFILES.get(key, "high")
+    level = video.get("level")
+    if isinstance(level, int) and 10 <= level <= 62:
+        profile["level"] = level
+    if video.get("refs"):
+        profile["refs"] = max(1, int(video["refs"]))
+    if video.get("has_b_frames") is not None:
+        profile["bframes"] = int(video["has_b_frames"])
+    sar = video.get("sample_aspect_ratio")
+    if isinstance(sar, str) and ":" in sar and sar != "0:1":
+        profile["sar"] = sar.replace(":", "/")
+    for probed, key in (
+        ("color_primaries", "color_primaries"),
+        ("color_transfer", "color_trc"),
+        ("color_space", "colorspace"),
+        ("color_range", "color_range"),
+    ):
+        value = video.get(probed)
+        if isinstance(value, str) and value not in ("unknown", "reserved"):
+            profile[key] = value
+
+    # Measure the keyframe cadence rather than assuming it.
+    frames = payload.get("frames") or []
+    keys = [index for index, frame in enumerate(frames) if frame.get("key_frame") == 1]
+    if len(keys) >= 2 and profile["fps"]:
+        spacing = statistics.median(b - a for a, b in zip(keys, keys[1:]))
+        seconds = spacing / profile["fps"]
+        if 0.4 <= seconds <= 10:
+            profile["gop_seconds"] = round(seconds, 3)
+    return profile
+
+
+def store_contribution_profile(stream_id: int, profile: dict[str, Any]) -> bool:
+    """Persist a probed profile; returns True when it actually changed."""
+    if profile == contribution_profile(stream_id):
+        return False
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO app_settings(key, value, updated_at) VALUES(?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+            (contribution_key(stream_id), json.dumps(profile), now()),
+        )
+    return True
+
+
+def slate_video_filter(profile: dict[str, Any], source_label: str = "0:v:0") -> str:
+    # Resolution and frame rate come from the stream this slate has to replace; a
+    # slate at a different size or cadence forces the viewer's decoder to
+    # reconfigure at the handoff. setsar matters for the same reason: x264 writes
+    # aspect_ratio_info_present_flag, so an unset SAR produces a different SPS.
+    width, height = int(profile["width"]), int(profile["height"])
+    sar = str(profile["sar"]).replace("/", "/")
+    return (
+        f"[{source_label}]scale={width}:{height}:force_original_aspect_ratio=decrease:flags=bicubic,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar={sar},"
+        f"fps={profile['fps']},format=yuv420p[v]"
+    )
+
+
+def slate_encode_args(profile: dict[str, Any]) -> list[str]:
+    """Encoder arguments for one stream's failover screens.
+
+    Every field that lands in the SPS or PPS is taken from that stream's own
+    observed feed -- resolution, frame rate, profile, level, reference frames,
+    B-frames, pixel aspect, and colour signalling -- because a screen only hands
+    off cleanly when its parameter sets match the stream it replaces. The
+    keyframe interval follows the measured cadence so the downstream segmenter
+    does not have to re-anchor at the splice.
+
+    Changing this recipe means bumping SLATE_ENCODER_VERSION; a stream whose feed
+    changes shape is picked up automatically through contribution_fingerprint.
+    """
+    fps = float(profile["fps"])
+    gop = max(1, round(fps * float(profile["gop_seconds"])))
+    bframes = int(profile["bframes"])
+    x264 = [
+        "stitchable=1",
+        f"ref={max(1, int(profile['refs']))}",
+        # Weighted prediction sets weighted_pred_flag in the PPS. OBS defaults it
+        # off; matching it avoids a parameter-set change mid-broadcast.
+        "weightp=0" if bframes == 0 else "weightp=1",
+        "cabac=1",
+        "8x8dct=1",
+        "aud=0",
+        "open-gop=0",
+        f"colorprim={profile['color_primaries']}",
+        f"transfer={profile['color_trc']}",
+        f"colormatrix={profile['colorspace']}",
+        f"fullrange={'on' if profile['color_range'] == 'pc' else 'off'}",
+        f"sar={profile['sar']}",
+    ]
+    return [
+        "-r", str(fps),
+        "-fps_mode", "cfr",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-profile:v", str(profile["profile"]),
+        "-level:v", f"{int(profile['level']) / 10:.1f}",
+        # B-frames change POC handling and make PTS != DTS, which the FLV muxer
+        # rejects, so a contribution feed using them still gets a slate without.
+        "-bf", "0",
+        "-g", str(gop),
+        "-keyint_min", str(gop),
+        "-sc_threshold", "0",
+        "-b:v", SLATE_VIDEO_BITRATE,
+        "-maxrate", SLATE_VIDEO_BITRATE,
+        "-bufsize", SLATE_VIDEO_BITRATE,
+        "-pix_fmt", "yuv420p",
+        "-color_primaries", str(profile["color_primaries"]),
+        "-color_trc", str(profile["color_trc"]),
+        "-colorspace", str(profile["colorspace"]),
+        "-color_range", str(profile["color_range"]),
+        "-x264-params", ":".join(x264),
+        "-c:a", "aac",
+        "-profile:a", "aac_low",
+        "-b:a", SLATE_AUDIO_BITRATE,
+        "-ar", "48000",
+        "-ac", "2",
+        "-map_metadata", "-1",
+        "-movflags", "+faststart",
+    ]
+
+
+async def generate_placeholder_slate(target: Path) -> bool:
+    """Render a plain standby card so a fresh install has a usable slate.
+
+    MediaMTX opens `alwaysAvailableFile` when it loads its configuration, so on a
+    brand-new deployment — before anyone has uploaded a BRB — there must already
+    be a file at that path or the media server cannot start.
+    """
+    pending = target.with_suffix(".bootstrap.mp4")
+    profile = dict(DEFAULT_CONTRIBUTION)
+    width, height = int(profile["width"]), int(profile["height"])
+    command = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i",
+        f"color=c=0x0C1319:s={width}x{height}:r={profile['fps']}:d=10",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+        # drawbox only: drawtext needs a font, and the runtime image ships none,
+        # so a text card would fail exactly when this placeholder is needed.
+        "-filter_complex",
+        f"[0:v:0]drawbox=x=(iw-300)/2:y=(ih/2)-8:w=300:h=6:color=0x35A7B8@0.9:t=fill,"
+        f"drawbox=x=(iw-180)/2:y=(ih/2)+20:w=180:h=6:color=0x35A7B8@0.45:t=fill,"
+        "setsar=1,format=yuv420p[v]",
+        # Two audio tracks so the slate's stream layout matches a live OBS feed
+        # that publishes track 1 and track 2.
+        "-map", "[v]", "-map", "1:a:0", "-map", "1:a:0",
+        "-t", "10",
+        *slate_encode_args(profile),
+        str(pending),
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await process.communicate()
+        if process.returncode:
+            log.error("could not render placeholder slate: %s", stderr.decode(errors="replace").strip()[:300])
+            pending.unlink(missing_ok=True)
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(pending, target)
+        log.info("rendered placeholder slate at %s", target)
+        return True
+    except Exception as exc:
+        log.error("could not render placeholder slate: %s", exc)
+        pending.unlink(missing_ok=True)
+        return False
+
+
+async def ensure_bootstrap_media() -> None:
+    """Guarantee a slate exists before MediaMTX is allowed to start."""
+    template = (DB_PATH.parent / "media" / "_default" / "brb.mp4")
+    if not template.exists() and ensure_default_media_template() is None:
+        await generate_placeholder_slate(template)
+    with connect() as conn:
+        slugs = [row["slug"] for row in conn.execute("SELECT slug FROM streams")]
+    # mediamtx.yml declares a static path whose alwaysAvailableFile must resolve
+    # at load time even before that user exists.
+    for slug in {*slugs, "studio"}:
+        try:
+            seed_stream_media(slug)
+        except Exception as exc:
+            log.warning("could not seed media for %s: %s", slug, exc)
 
 
 def ensure_default_media_template() -> Path | None:
@@ -639,20 +1095,21 @@ def seed_stream_media(slug: str) -> bool:
     return True
 
 
-def fallback_path_config(slug: str) -> dict[str, Any]:
-    return {
-        "source": "publisher",
-        "overridePublisher": True,
-        "alwaysAvailable": True,
-        "alwaysAvailableFile": f"/relay-data/media/{slug}/active.mp4",
-    }
+def fallback_path_config(slug: str, with_fallback: bool = True) -> dict[str, Any]:
+    config: dict[str, Any] = {"source": "publisher", "overridePublisher": True}
+    if with_fallback:
+        config["alwaysAvailable"] = True
+        config["alwaysAvailableFile"] = f"/relay-data/media/{slug}/active.mp4"
+    return config
 
 
-async def ensure_fallback_path(slug: str, force_reload: bool = False) -> bool:
-    if not seed_stream_media(slug):
-        return False
+async def ensure_fallback_path(slug: str) -> bool:
+    # Path creation must not depend on a slate existing: an invited streamer with
+    # no uploads still needs somewhere to publish. Only the always-available keys
+    # are conditional.
+    seeded = seed_stream_media(slug)
     encoded = quote(slug, safe="")
-    payload = fallback_path_config(slug)
+    payload = fallback_path_config(slug, with_fallback=seeded)
     async with httpx.AsyncClient(timeout=10) as client:
         response = await client.get(f"{MEDIAMTX_API}/v3/config/paths/get/{encoded}")
         if response.status_code == 404:
@@ -661,21 +1118,62 @@ async def ensure_fallback_path(slug: str, force_reload: bool = False) -> bool:
                 json=payload,
             )
             response.raise_for_status()
+            log.info("created MediaMTX path for %s (fallback=%s)", slug, seeded)
             return True
         response.raise_for_status()
         current = response.json()
-        changed = any(current.get(key) != value for key, value in payload.items())
-        if force_reload or changed:
+        if any(current.get(key) != value for key, value in payload.items()):
             response = await client.patch(
                 f"{MEDIAMTX_API}/v3/config/paths/patch/{encoded}",
                 json=payload,
             )
             response.raise_for_status()
+            log.info("updated MediaMTX path config for %s", slug)
     return True
 
 
-async def reload_fallback_path(slug: str) -> None:
-    await ensure_fallback_path(slug, force_reload=True)
+async def path_is_idle(slug: str) -> bool:
+    """True when nothing is publishing to or reading from this path."""
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            response = await client.get(f"{MEDIAMTX_API}/v3/paths/get/{quote(slug, safe='')}")
+            if response.status_code == 404:
+                return True
+            response.raise_for_status()
+            path = response.json()
+    except Exception:
+        return False
+    source = path.get("source") or {}
+    # "ready" is useless here — an always-available path is always ready. Idle
+    # means no publisher and nobody reading, because recreating the path drops
+    # both.
+    return not path.get("online", path.get("ready")) and not source and not path.get("readers")
+
+
+async def reload_fallback_path(slug: str) -> bool:
+    """Make MediaMTX reopen active.mp4, returning False when it had to be staged.
+
+    MediaMTX reads the always-available file's parameter sets when the path is
+    created and the offline player keeps its own descriptors open, so replacing
+    active.mp4 has no effect until the path is recreated. Recreating disconnects
+    whoever is attached, so it only happens when the path is genuinely idle;
+    otherwise the new screen goes on air at the next reconnect.
+    """
+    if not await path_is_idle(slug):
+        log.info("staged screen change for %s; path is in use", slug)
+        return False
+    encoded = quote(slug, safe="")
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.delete(f"{MEDIAMTX_API}/v3/config/paths/delete/{encoded}")
+            if response.status_code != 404:
+                response.raise_for_status()
+        await ensure_fallback_path(slug)
+        log.info("reloaded MediaMTX path for %s", slug)
+        return True
+    except Exception as exc:
+        log.warning("could not reload path for %s: %s", slug, exc)
+        return False
 
 
 async def kick_stream_publishers(slug: str) -> None:
@@ -735,8 +1233,15 @@ class PathReconciler:
         for slug in slugs:
             try:
                 await ensure_fallback_path(slug)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Slug only — never the file path or any credential.
+                log.warning("path reconcile failed for %s: %s", slug, exc)
+        # Re-arm any destination whose worker died for good; start() no-ops when
+        # a task is already running, so this is cheap and idempotent.
+        try:
+            await workers.start_enabled()
+        except Exception as exc:
+            log.warning("worker re-arm failed: %s", exc)
 
     async def _loop(self) -> None:
         while True:
@@ -747,23 +1252,51 @@ class PathReconciler:
 path_reconciler = PathReconciler()
 
 
+_activation_locks: dict[str, asyncio.Lock] = {}
+
+
+def _swap_active_file(source: Path, active: Path) -> None:
+    """Publish `source` as `active.mp4` without ever exposing a torn file.
+
+    Screen assets are only ever replaced wholesale via os.replace, never written
+    in place, so a hard link is safe and turns a multi-hundred-megabyte copy into
+    a constant-time operation. Falls back to copying across filesystems.
+    """
+    pending = active.with_suffix(".pending.mp4")
+    pending.unlink(missing_ok=True)
+    try:
+        os.link(source, pending)
+    except OSError:
+        shutil.copyfile(source, pending)
+    os.replace(pending, active)
+
+
 async def activate_screen_file(stream: sqlite3.Row, kind: str, reload_path: bool) -> None:
     source = media_asset_path(stream["slug"], kind)
     if not source.exists():
         raise HTTPException(status_code=409, detail=f"Upload the {kind.replace('_', ' ')} screen first")
     active = active_media_path(stream["slug"])
-    pending = active.with_suffix(".pending.mp4")
-    shutil.copyfile(source, pending)
-    os.replace(pending, active)
+    lock = _activation_locks.setdefault(stream["slug"], asyncio.Lock())
+    async with lock:
+        try:
+            if active.exists() and os.path.samefile(source, active):
+                set_screen_mode(stream["id"], kind)
+                if reload_path:
+                    await reload_fallback_path(stream["slug"])
+                return
+        except OSError:
+            pass
+        await asyncio.to_thread(_swap_active_file, source, active)
     set_screen_mode(stream["id"], kind)
     if reload_path:
         await reload_fallback_path(stream["slug"])
 
 
 def media_assets_state(stream: sqlite3.Row) -> dict[str, Any]:
+    fingerprint = contribution_fingerprint(contribution_profile(stream["id"]))
     with connect() as conn:
         rows = conn.execute(
-            "SELECT kind, status, original_name, message, updated_at FROM media_assets WHERE stream_id = ?",
+            "SELECT kind, status, original_name, message, updated_at, encoder_fingerprint FROM media_assets WHERE stream_id = ?",
             (stream["id"],),
         ).fetchall()
     assets = {row["kind"]: dict(row) for row in rows}
@@ -775,6 +1308,7 @@ def media_assets_state(stream: sqlite3.Row) -> dict[str, Any]:
                 "original_name": "Current relay screen",
                 "message": None,
                 "updated_at": None,
+                "encoder_fingerprint": None,
             }
         elif kind not in assets:
             assets[kind] = {
@@ -783,7 +1317,14 @@ def media_assets_state(stream: sqlite3.Row) -> dict[str, Any]:
                 "original_name": None,
                 "message": None,
                 "updated_at": None,
+                "encoder_fingerprint": None,
             }
+        # A screen encoded for a different feed shape still plays, but it will
+        # not hand off cleanly, so the dashboard prompts for a re-upload.
+        assets[kind]["stale"] = (
+            assets[kind]["status"] == "ready"
+            and assets[kind].get("encoder_fingerprint") != fingerprint
+        )
     return {
         "mode": current_screen_mode(stream["id"]),
         "program_mode": current_program_mode(stream["id"]),
@@ -822,17 +1363,19 @@ class MediaConversionManager:
         status: str,
         original_name: str,
         message: str | None = None,
+        encoder_fingerprint: str | None = None,
     ) -> None:
         with connect() as conn:
             conn.execute(
-                """INSERT INTO media_assets(stream_id, kind, status, original_name, message, updated_at)
-                   VALUES(?, ?, ?, ?, ?, ?)
+                """INSERT INTO media_assets(stream_id, kind, status, original_name, message, updated_at, encoder_fingerprint)
+                   VALUES(?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(stream_id, kind) DO UPDATE SET
                        status = excluded.status,
                        original_name = excluded.original_name,
                        message = excluded.message,
-                       updated_at = excluded.updated_at""",
-                (stream_id, kind, status, original_name, message, now()),
+                       updated_at = excluded.updated_at,
+                       encoder_fingerprint = excluded.encoder_fingerprint""",
+                (stream_id, kind, status, original_name, message, now(), encoder_fingerprint),
             )
 
     async def _probe(self, source: Path) -> tuple[float, bool]:
@@ -858,7 +1401,10 @@ class MediaConversionManager:
         if duration < 2:
             raise ValueError("Screen videos must be at least 2 seconds long")
         if duration > MEDIA_MAX_DURATION_SECONDS:
-            raise ValueError("Screen videos can be up to 30 minutes long")
+            raise ValueError(
+                f"Screen videos can be up to {MEDIA_MAX_DURATION_SECONDS // 60} minutes long. "
+                "Shorter screens also switch on air faster."
+            )
         return duration, has_audio
 
     async def _convert(
@@ -886,11 +1432,9 @@ class MediaConversionManager:
                 "-i",
                 "anullsrc=r=48000:cl=stereo",
             ]
-            video_filter = (
-                "[0:v:0]scale=1920:1080:force_original_aspect_ratio=decrease,"
-                "pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,"
-                "fps=48,format=yuv420p[v]"
-            )
+            # Match this stream's own contribution feed, not a fixed recipe.
+            profile = contribution_profile(stream["id"])
+            video_filter = slate_video_filter(profile)
             if has_audio:
                 command.extend(
                     [
@@ -921,42 +1465,9 @@ class MediaConversionManager:
                 [
                     "-t",
                     f"{duration:.3f}",
-                    "-c:v",
-                    "libx264",
-                    "-preset",
-                    "veryfast",
-                    "-profile:v",
-                    "high",
-                    "-level:v",
-                    "4.2",
-                    "-b:v",
-                    "8000k",
-                    "-maxrate",
-                    "8000k",
-                    "-bufsize",
-                    "16000k",
-                    "-g",
-                    "96",
-                    "-keyint_min",
-                    "96",
-                    "-sc_threshold",
-                    "0",
-                    "-pix_fmt",
-                    "yuv420p",
+                    *slate_encode_args(profile),
                     "-threads",
                     "2",
-                    "-c:a",
-                    "aac",
-                    "-b:a",
-                    "160k",
-                    "-ar",
-                    "48000",
-                    "-ac",
-                    "2",
-                    "-map_metadata",
-                    "-1",
-                    "-movflags",
-                    "+faststart",
                     str(output),
                 ]
             )
@@ -971,20 +1482,28 @@ class MediaConversionManager:
                 raise RuntimeError(detail[-1] if detail else "FFmpeg could not convert this video")
             final = media_asset_path(stream["slug"], kind)
             os.replace(output, final)
-            self._set_status(stream["id"], kind, "ready", original_name)
+            self._set_status(
+                stream["id"], kind, "ready", original_name,
+                encoder_fingerprint=contribution_fingerprint(profile),
+            )
             mode = current_screen_mode(stream["id"])
             status = await media_status(stream["slug"])
-            if kind == mode:
-                await activate_screen_file(stream, kind, reload_path=not status["online"])
-            elif kind == "brb" and status["online"]:
-                await activate_screen_file(stream, "brb", reload_path=False)
+            try:
+                if kind == mode:
+                    await activate_screen_file(stream, kind, reload_path=not status["online"])
+                elif kind == "brb" and status["online"]:
+                    await activate_screen_file(stream, "brb", reload_path=False)
+            except Exception as exc:
+                # The conversion itself succeeded; a MediaMTX hiccup while
+                # activating must not report the upload as failed.
+                log.warning("converted %s but could not activate it: %s", kind, exc)
         except asyncio.CancelledError:
             if process and process.returncode is None:
                 process.kill()
                 await process.wait()
             raise
         except Exception as exc:
-            self._set_status(stream["id"], kind, "error", original_name, str(exc)[:500])
+            self._set_status(stream["id"], kind, "error", original_name, redact(str(exc))[:500])
         finally:
             source.unlink(missing_ok=True)
             output.unlink(missing_ok=True)
@@ -993,10 +1512,284 @@ class MediaConversionManager:
 media_conversions = MediaConversionManager()
 
 
+AUDIO_CODEC_HINTS = ("audio", "aac", "opus", "ac-3", "g711", "lpcm", "mp3", "vorbis")
+
+
+def audio_track_count(media: dict[str, Any]) -> int | None:
+    """How many audio tracks the path is publishing, or None when unknown.
+
+    MediaMTX's `tracks` list mixes video and audio, so it cannot be used as a
+    count directly. None matters as much as a number: a worker usually starts
+    before OBS connects, and assuming a single track then would permanently
+    forward only track 1.
+    """
+    if not media.get("known", True) or not media.get("available"):
+        return None
+    tracks2 = media.get("tracks2") or []
+    if tracks2:
+        return sum(
+            1
+            for track in tracks2
+            if (track.get("codecProps") or {}).get("sampleRate")
+            or any(hint in str(track.get("codec", "")).lower() for hint in AUDIO_CODEC_HINTS)
+        )
+    tracks = media.get("tracks") or []
+    if not tracks:
+        return None
+    return sum(
+        1 for track in tracks if any(hint in str(track).lower() for hint in AUDIO_CODEC_HINTS)
+    )
+
+
+def build_audio_args(
+    platform: str, audio_tracks: int | None, music_fallback: bool = True
+) -> list[str]:
+    """Audio mapping for one destination, derived entirely from the platform.
+
+    The relay never mixes and never re-encodes — OBS owns every mix and this is
+    always a straight `-c copy` forward. OBS track 1 is the full live mix (music
+    + game + voice) and track 2 is the clean mix (game + voice, no music).
+    Tracks 3-6 ride along in the SRT feed and are simply never mapped, so there
+    is nothing for the user to choose.
+
+    Twitch is the only platform that carries both. Enhanced RTMP multitrack
+    sends track 1 as the live audio and track 2 as the separate VOD track, so
+    the archive stays free of music without changing what live viewers hear;
+    that encapsulation needs the FFmpeg 8.x build pinned by FFMPEG_RELEASE in
+    router/Dockerfile. YouTube and X archive or auto-publish the replay, so they
+    take the clean track only. RPLAY and custom destinations stay unpublished
+    and take the full live mix.
+
+    `audio_tracks` is None when the publisher's layout is not yet known — a
+    worker usually starts before OBS connects — in which case the documented
+    two-track layout is assumed.
+
+    `music_fallback` only changes what YouTube and X do when the clean track is
+    missing, and it defaults to True — track 1 — because the alternative is
+    emitting FLV with no audio track at all, and that has never been verified
+    against either ingest. A stream the service rejects outright, or archives
+    silent, is a worse and far likelier failure than one carrying the wrong mix.
+    The cost is real and known: YouTube runs Content ID over the archive and X
+    auto-publishes the replay, so a one-track publish puts the music mix on two
+    scanned destinations. But a publisher sending one track is misconfigured
+    whatever this flag says — the setup has to be fixed either way — so the
+    answer is to make the degraded state loud in the dashboard rather than to
+    trade a certain outage for an uncertain one. Setting this False is the
+    explicit opt-out for an operator who would rather go silent than mistaken.
+    """
+    args = ["-map", "0:v:0"]
+    # Twitch, RPLAY and custom take track 1 in the normal case too, so degrading
+    # to it inverts nothing. Only the clean-track platforms have a choice to
+    # make here.
+    clean_track_only = platform in {"youtube", "x"}
+    if audio_tracks is not None and audio_tracks < 2:
+        # Referencing 0:a:1 against a publisher that is not sending it fails the
+        # whole command, so every platform degrades to whatever exists — and a
+        # video-only publisher gets no audio map at all rather than parking every
+        # destination on this stream in retrying forever. That same no-audio-map
+        # shape is what an opted-out YouTube or X destination gets: it stays
+        # connected and silent instead of taking the music mix.
+        if audio_tracks and (not clean_track_only or music_fallback):
+            args.extend(["-map", "0:a:0"])
+    elif platform == "twitch":
+        args.extend(["-map", "0:a:0", "-map", "0:a:1"])
+    elif clean_track_only:
+        args.extend(["-map", "0:a:1"])
+    else:
+        args.extend(["-map", "0:a:0"])
+    args.extend(["-c", "copy", "-muxdelay", "0", "-muxpreload", "0"])
+    return args
+
+
+def parse_progress_block(block: dict[str, str]) -> dict[str, Any]:
+    """Normalise one ffmpeg -progress block into plain numbers."""
+
+    def number(key: str) -> float | None:
+        raw = (block.get(key) or "").strip()
+        if not raw or raw.startswith("N/A"):
+            return None
+        raw = raw.removesuffix("kbits/s").removesuffix("x").strip()
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    out_time_us = number("out_time_us")
+    # ffmpeg's own `bitrate=` is deliberately not carried here. It is
+    # total_size * 8 / out_time, a lifetime average, and any caller that
+    # reached for it would be showing a user a number that means "since this
+    # process started" while claiming to mean "now". Rate is derived from
+    # total_bytes deltas by derive_output_rate instead.
+    return {
+        "total_bytes": number("total_size"),
+        "frames": number("frame"),
+        "fps": number("fps"),
+        "speed": number("speed"),
+        "drop_frames": number("drop_frames"),
+        "dup_frames": number("dup_frames"),
+        "out_time_s": (out_time_us / 1_000_000) if out_time_us is not None else None,
+    }
+
+
+def derive_output_rate(
+    history: Sequence[tuple[float, float]],
+    window_s: float = METRICS_OUTPUT_RATE_WINDOW_S,
+) -> float | None:
+    """Current output rate in kbps from an (out_time_s, total_bytes) history.
+
+    The time base is ffmpeg's own output clock, not the wall clock we read the
+    block on. Both numbers arrive in the same -progress block, so they stay
+    consistent with each other however late the reader gets to them; timestamping
+    on arrival instead would difference several seconds of bytes across a
+    millisecond whenever a backlog drains in one wakeup, and print a rate several
+    times the truth. Staleness is a separate question and is answered from the
+    wall clock in `snapshot`.
+
+    Why derive it at all: ffmpeg reports `bitrate=` as total_size * 8 /
+    out_time, an average over the whole life of the process. A worker that
+    spent its first minute pushing the 96 KB failover slate still reads
+    hundreds of kbps low ten minutes later, and the figure only ever creeps up
+    as the process ages. Nobody should ever be shown a lifetime bitrate: the
+    panel says "now", so it has to mean now.
+
+    Why the window is several seconds and not the gap between two consecutive
+    blocks: workers run with -stats_period 1, and output bytes leave in
+    keyframe-sized lumps. Differencing over ~1 s against a 2 s GOP aliases the
+    keyframe cadence into a sawtooth that swings either side of the true rate,
+    which is exactly the kind of number-that-does-not-mean-what-it-looks-like
+    that cost this panel its credibility in the first place. `then` is the most
+    recent sample at least `window_s` old, so the span stays bounded no matter
+    how much history is retained; before a worker has that much history a
+    shorter span is accepted, down to METRICS_OUTPUT_RATE_MIN_SPAN_S, so the
+    panel fills in within a couple of seconds instead of sitting blank.
+
+    Returns None rather than a guess whenever the history cannot support an
+    honest answer: a single sample, too short a span, a clock that did not
+    advance, or a byte counter that went backwards.
+    """
+    if len(history) < 2:
+        return None
+    now_t, now_bytes = history[-1]
+    then_t, then_bytes = history[0]
+    for point in history:
+        if now_t - point[0] < window_s:
+            break
+        then_t, then_bytes = point
+    span = now_t - then_t
+    if span <= 0 or span < min(window_s, METRICS_OUTPUT_RATE_MIN_SPAN_S):
+        return None
+    delta = now_bytes - then_bytes
+    if delta < 0:
+        # Counter restarted underneath us; no rate beats a negative one.
+        return None
+    return delta * 8 / span / 1000
+
+
 class WorkerManager:
     def __init__(self) -> None:
         self.tasks: dict[int, asyncio.Task] = {}
+        self.locks: dict[int, asyncio.Lock] = {}
+        # Destinations whose current teardown must not send a clean RTMP
+        # unpublish, because we intend to reconnect immediately.
+        self.abrupt: set[int] = set()
         self.stopping = False
+        # Per-destination live telemetry, never persisted at sample rate.
+        self.metrics: dict[int, dict[str, Any]] = {}
+
+    def _lock(self, destination_id: int) -> asyncio.Lock:
+        return self.locks.setdefault(destination_id, asyncio.Lock())
+
+    def snapshot(self, destination_id: int) -> dict[str, Any]:
+        entry = self.metrics.get(destination_id)
+        if not entry:
+            return {
+                "bitrate_kbps": None, "speed": None, "frames": None,
+                "total_bytes": None, "uptime_s": None, "sample_age_s": None,
+                "series": [],
+            }
+        last = entry.get("last") or {}
+        started = entry.get("started_at")
+        sampled = entry.get("sampled_at")
+        rate = entry.get("rate_kbps")
+        # A derived rate is only true while blocks keep arriving. If ffmpeg's
+        # output write wedges, _read_progress stops and this value would sit on
+        # screen labelled "right now" until the stall watchdog fires seconds
+        # later. Expire it over the same window it was measured across, so a
+        # stalled forwarder reads as unknown rather than as its last good rate.
+        if sampled is None or time.monotonic() - sampled > METRICS_OUTPUT_RATE_WINDOW_S * 2:
+            rate = None
+        return {
+            # Current rate, derived from total_size deltas over the last few
+            # seconds — NOT ffmpeg's `bitrate=` field, which is a lifetime
+            # average and is deliberately no longer parsed. The key keeps its
+            # name because the name is now finally accurate; do not repoint it
+            # at a -progress field.
+            "bitrate_kbps": round(rate, 1) if rate is not None else None,
+            "speed": last.get("speed"),
+            "frames": last.get("frames"),
+            "total_bytes": last.get("total_bytes"),
+            "uptime_s": round(time.monotonic() - started, 1) if started else None,
+            "sample_age_s": round(time.monotonic() - sampled, 1) if sampled else None,
+            "series": list(entry["series"])[-METRICS_SERIES_POINTS:],
+        }
+
+    def _reset_metrics(self, destination_id: int) -> None:
+        self.metrics[destination_id] = {
+            "series": deque(maxlen=METRICS_OUTPUT_SAMPLES),
+            # (monotonic, total_bytes) pairs behind the derived rate. Cleared
+            # with everything else so a restarted worker never differences its
+            # fresh byte counter against the dead process's last reading.
+            "rate_history": deque(maxlen=METRICS_OUTPUT_SAMPLES),
+            "rate_kbps": None,
+            "last": {},
+            "started_at": time.monotonic(),
+            "sampled_at": None,
+        }
+
+    async def _read_progress(self, stream: asyncio.StreamReader, destination_id: int) -> None:
+        """Consume -progress from stdout.
+
+        This must run concurrently with the stderr reader: an undrained pipe
+        deadlocks ffmpeg once 64 KiB accumulates.
+        """
+        block: dict[str, str] = {}
+        async for raw_line in stream:
+            line = raw_line.decode(errors="replace").strip()
+            if not line or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            block[key.strip()] = value
+            if key.strip() != "progress":
+                continue
+            sample = parse_progress_block(block)
+            block = {}
+            entry = self.metrics.get(destination_id)
+            if entry is None:
+                continue
+            now = time.monotonic()
+            entry["last"] = sample
+            entry["sampled_at"] = now
+            total_bytes = sample["total_bytes"]
+            out_time = sample["out_time_s"]
+            if total_bytes is None or out_time is None:
+                # The tee muxer (YouTube primary+backup) reports total_size as
+                # N/A, so there is nothing to difference — and without
+                # out_time there is no honest time base either. No number is the
+                # right answer; ffmpeg's cumulative bitrate=, the input rate and
+                # speed are all wrong answers dressed up as right ones.
+                entry["rate_kbps"] = None
+                continue
+            history = entry["rate_history"]
+            history.append((out_time, total_bytes))
+            # Twice the window is all the lookback the derivation can use, and
+            # holding more would only keep stale bytes around across a stall.
+            cutoff = out_time - METRICS_OUTPUT_RATE_WINDOW_S * 2
+            while history and history[0][0] < cutoff:
+                history.popleft()
+            rate = derive_output_rate(history, METRICS_OUTPUT_RATE_WINDOW_S)
+            entry["rate_kbps"] = rate
+            if rate is not None:
+                entry["series"].append(round(rate, 1))
 
     async def start_enabled(self) -> None:
         with connect() as conn:
@@ -1016,22 +1809,60 @@ class WorkerManager:
         task = self.tasks.get(destination_id)
         if task and not task.done():
             return
-        self.tasks[destination_id] = asyncio.create_task(self._run(destination_id))
+        task = asyncio.create_task(self._run(destination_id))
+        self.tasks[destination_id] = task
+        # Reap so a long-lived process never accumulates finished tasks.
+        task.add_done_callback(
+            lambda finished, key=destination_id: self.tasks.pop(key, None)
+            if self.tasks.get(key) is finished
+            else None
+        )
 
-    async def stop(self, destination_id: int) -> None:
-        task = self.tasks.pop(destination_id, None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        self._set_state(destination_id, "off", None)
+    async def stop(self, destination_id: int, *, abrupt: bool = False) -> None:
+        """Stop a worker.
+
+        `abrupt` decides what the platform is told. On SIGTERM, FFmpeg runs its
+        normal shutdown and the RTMP muxer sends FCUnpublish and deleteStream —
+        exactly what OBS sends when a streamer presses Stop Streaming — so the
+        platform treats the broadcast as deliberately ended, which on Twitch can
+        mean a new stream id, a split VOD, and a reset viewer count.
+
+        That is right when the user is turning a destination off, and wrong when
+        we are only restarting to apply a setting. SIGKILL drops the socket with
+        no unpublish, so the platform sees a brief connection loss instead and
+        the session survives the reconnect.
+        """
+        # Serialise against a concurrent start so a toggle storm cannot leave two
+        # FFmpeg processes publishing to the same stream key.
+        async with self._lock(destination_id):
+            if abrupt:
+                self.abrupt.add(destination_id)
+            task = self.tasks.get(destination_id)
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    if self.tasks.get(destination_id) is task:
+                        self.tasks.pop(destination_id, None)
+            self.abrupt.discard(destination_id)
+            self.metrics.pop(destination_id, None)
+            # Only claim "off" if it has not been re-enabled in the meantime.
+            with connect() as conn:
+                conn.execute(
+                    "UPDATE destinations SET state = 'off', last_error = NULL WHERE id = ? AND enabled = 0",
+                    (destination_id,),
+                )
 
     async def shutdown(self) -> None:
         self.stopping = True
-        for destination_id in list(self.tasks):
-            await self.stop(destination_id)
+        await asyncio.gather(
+            *(self.stop(destination_id) for destination_id in list(self.tasks)),
+            return_exceptions=True,
+        )
+        self.stopping = False
 
     def _set_state(self, destination_id: int, state: str, error: str | None) -> None:
         with connect() as conn:
@@ -1040,118 +1871,404 @@ class WorkerManager:
                 (state, error[:500] if error else None, destination_id),
             )
 
+    def _destination_urls(self, row: sqlite3.Row) -> tuple[str, str | None]:
+        secret = decrypt(row["output_url_enc"])
+        preset = not secret.startswith(("rtmp://", "rtmps://"))
+        if row["platform"] == "twitch" and preset:
+            return twitch_ingests.output_url(secret), None
+        if row["platform"] == "rplay" and preset:
+            return f"{RPLAY_BASE_URL}/{secret}", None
+        if row["platform"] == "x" and preset:
+            return f"{X_BASE_URL}/{secret}", None
+        if row["platform"] == "youtube" and preset:
+            # ?backup=1 belongs to the RTMP *app*, not the playpath; appending it
+            # after the key makes FFmpeg send it as part of the stream name.
+            return (
+                f"{YOUTUBE_PRIMARY_BASE_URL}/{secret}",
+                f"{YOUTUBE_BACKUP_BASE_URL}?backup=1/{secret}",
+            )
+        return secret, None
+
     async def _run(self, destination_id: int) -> None:
         process: asyncio.subprocess.Process | None = None
         pinned_output_url: str | None = None
         pinned_backup_url: str | None = None
+        failures = 0
         try:
             while not self.stopping:
-                with connect() as conn:
-                    row = conn.execute(
-                        """SELECT d.*, s.slug, u.enabled AS user_enabled FROM destinations d
-                           JOIN streams s ON s.id = d.stream_id
-                           JOIN users u ON u.id = s.user_id
-                           WHERE d.id = ?""",
-                        (destination_id,),
-                    ).fetchone()
-                if row is None or not row["enabled"] or not row["user_enabled"]:
-                    return
+                try:
+                    with connect() as conn:
+                        row = conn.execute(
+                            """SELECT d.*, s.slug, u.enabled AS user_enabled FROM destinations d
+                               JOIN streams s ON s.id = d.stream_id
+                               JOIN users u ON u.id = s.user_id
+                               WHERE d.id = ?""",
+                            (destination_id,),
+                        ).fetchone()
+                    if row is None or not row["enabled"] or not row["user_enabled"]:
+                        return
 
-                if pinned_output_url is None:
-                    destination_secret = decrypt(row["output_url_enc"])
-                    if row["platform"] == "twitch" and not destination_secret.startswith(("rtmp://", "rtmps://")):
-                        pinned_output_url = twitch_ingests.output_url(destination_secret)
-                    elif row["platform"] == "rplay" and not destination_secret.startswith(("rtmp://", "rtmps://")):
-                        pinned_output_url = f"{RPLAY_BASE_URL}/{destination_secret}"
-                    elif row["platform"] == "x" and not destination_secret.startswith(("rtmp://", "rtmps://")):
-                        pinned_output_url = f"{X_BASE_URL}/{destination_secret}"
-                    elif row["platform"] == "youtube" and not destination_secret.startswith(("rtmp://", "rtmps://")):
-                        pinned_output_url = f"{YOUTUBE_PRIMARY_BASE_URL}/{destination_secret}"
-                        pinned_backup_url = f"{YOUTUBE_BACKUP_BASE_URL}/{destination_secret}?backup=1"
-                    else:
-                        pinned_output_url = destination_secret
-                output_url = pinned_output_url
-                source = (
-                    f"rtsp://{quote(MEDIA_INTERNAL_USER, safe='')}:{quote(MEDIA_INTERNAL_PASS, safe='')}"
-                    f"@{MEDIAMTX_RTSP}/{row['slug']}"
-                )
-                command = [
-                    "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
-                    "-rtsp_transport", "tcp", "-i", source,
-                ]
-                if row["audio_track"] in {3, 4}:
-                    command.extend([
-                        "-filter_complex",
-                        "[0:a:0][0:a:1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95[live]",
-                        "-map", "0:v:0", "-map", "[live]",
-                        "-c:v", "copy", "-c:a:0", "aac", "-b:a:0", "160k",
-                    ])
-                    if row["audio_track"] == 3:
-                        command.extend(["-map", "0:a:1", "-c:a:1", "copy"])
-                else:
-                    command.extend([
-                        "-map", "0:v:0", "-map", f"0:a:{row['audio_track'] - 1}",
-                        "-c", "copy",
-                    ])
-                if pinned_backup_url:
-                    tee_output = (
-                        f"[f=flv:onfail=ignore:flvflags=no_duration_filesize]{output_url}"
-                        f"|[f=flv:onfail=ignore:flvflags=no_duration_filesize]{pinned_backup_url}"
+                    if pinned_output_url is None:
+                        # Pinned for the lifetime of a forwarding process so the
+                        # Twitch ingest cannot change mid-broadcast, but
+                        # re-derived after repeated failures so a dead ingest is
+                        # not retried forever.
+                        pinned_output_url, pinned_backup_url = self._destination_urls(row)
+                    output_url = pinned_output_url
+                    source = (
+                        f"rtsp://{quote(MEDIA_INTERNAL_USER, safe='')}:{quote(MEDIA_INTERNAL_PASS, safe='')}"
+                        f"@{MEDIAMTX_RTSP}/{row['slug']}"
                     )
-                    command.extend([
-                        "-use_fifo", "1",
-                        "-fifo_options", "attempt_recovery=1:recover_any_error=1:recovery_wait_time=1",
-                        "-f", "tee", tee_output,
-                    ])
-                else:
-                    command.extend([
-                        "-flvflags", "no_duration_filesize",
-                        "-f", "flv", output_url,
-                    ])
-                self._set_state(destination_id, "connecting", None)
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                await asyncio.sleep(2)
-                if process.returncode is None:
-                    self._set_state(destination_id, "forwarding", None)
+                    media = await media_status(row["slug"])
+                    command = [
+                        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+                        "-rtsp_transport", "tcp",
+                        # Without this a stalled RTSP session blocks forever and
+                        # the destination sits on "forwarding" with no retry.
+                        "-timeout", "10000000",
+                        "-i", source,
+                        "-progress", "pipe:1", "-stats_period", "1",
+                    ]
+                    command.extend(
+                        build_audio_args(
+                            row["platform"],
+                            audio_track_count(media),
+                            bool(row["music_fallback"]),
+                        )
+                    )
+                    if pinned_backup_url:
+                        tee_output = (
+                            f"[f=flv:onfail=ignore:flvflags=no_duration_filesize]{output_url}"
+                            f"|[f=flv:onfail=ignore:flvflags=no_duration_filesize]{pinned_backup_url}"
+                        )
+                        command.extend([
+                            "-use_fifo", "1",
+                            # Without drop_pkts_on_overflow a stalled backup
+                            # ingest blocks the producer and starves the healthy
+                            # primary. Overflow flushes the queue, so the restart
+                            # must resume on a keyframe.
+                            "-fifo_options",
+                            "queue_size=240:drop_pkts_on_overflow=1:restart_with_keyframe=1"
+                            ":attempt_recovery=1:recover_any_error=1:recovery_wait_time=1"
+                            ":max_recovery_attempts=10",
+                            "-f", "tee", tee_output,
+                        ])
+                    else:
+                        command.extend([
+                            "-flvflags", "no_duration_filesize",
+                            "-f", "flv", output_url,
+                        ])
+                    self._set_state(destination_id, "connecting", None)
+                    self._reset_metrics(destination_id)
+                    with connect() as conn:
+                        conn.execute(
+                            "UPDATE destinations SET restart_count = restart_count + 1, last_started_at = ? WHERE id = ?",
+                            (now(), destination_id),
+                        )
+                    started = time.monotonic()
+                    process = await asyncio.create_subprocess_exec(
+                        *command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
 
-                last_line = ""
-                assert process.stderr is not None
-                async for raw_line in process.stderr:
-                    line = raw_line.decode(errors="replace").strip()
-                    if line:
-                        last_line = line.replace(output_url, "[destination]")
-                        if pinned_backup_url:
-                            last_line = last_line.replace(pinned_backup_url, "[backup destination]")
-                code = await process.wait()
-                process = None
-                if self.stopping:
-                    return
-                self._set_state(destination_id, "retrying", last_line or f"Forwarder exited with code {code}")
-                await asyncio.sleep(3)
+                    errors: deque[str] = deque(maxlen=WORKER_ERROR_LINES)
+
+                    async def drain_stderr(pipe: asyncio.StreamReader) -> None:
+                        async for raw_line in pipe:
+                            line = raw_line.decode(errors="replace").strip()
+                            if line:
+                                errors.append(redact(line, output_url, pinned_backup_url, source))
+
+                    assert process.stdout is not None and process.stderr is not None
+                    readers = [
+                        asyncio.create_task(self._read_progress(process.stdout, destination_id)),
+                        asyncio.create_task(drain_stderr(process.stderr)),
+                    ]
+                    try:
+                        code = await self._supervise(destination_id, process)
+                    finally:
+                        for reader in readers:
+                            reader.cancel()
+                        await asyncio.gather(*readers, return_exceptions=True)
+                    process = None
+                    if self.stopping:
+                        return
+
+                    if time.monotonic() - started >= WORKER_HEALTHY_SECONDS:
+                        failures = 0
+                    else:
+                        failures += 1
+                    if failures and failures % 5 == 0:
+                        pinned_output_url = None
+                        pinned_backup_url = None
+                    detail = " · ".join(list(errors)[-3:]) or f"Forwarder exited with code {code}"
+                    self._set_state(destination_id, "retrying", detail)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Anything transient — a locked database, a subprocess spawn
+                    # failure — must retry rather than kill the destination for
+                    # the rest of the process's life.
+                    failures += 1
+                    log.warning("worker %s error: %s", destination_id, redact(str(exc)))
+                    try:
+                        self._set_state(destination_id, "retrying", redact(str(exc)))
+                    except Exception:
+                        pass
+                delay = min(WORKER_RETRY_MAX_SECONDS, WORKER_RETRY_MIN_SECONDS * (2 ** min(failures, 6)))
+                await asyncio.sleep(delay * random.uniform(0.7, 1.3))
         except asyncio.CancelledError:
             if process and process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=4)
-                except asyncio.TimeoutError:
+                if destination_id in self.abrupt:
+                    # No SIGTERM: letting FFmpeg shut down cleanly would tell the
+                    # platform the broadcast ended on purpose.
                     process.kill()
                     await process.wait()
+                else:
+                    process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=2)
+                    except asyncio.TimeoutError:
+                        process.kill()
+                        await process.wait()
             raise
-        except Exception as exc:
-            self._set_state(destination_id, "error", str(exc))
+        finally:
+            self.metrics.pop(destination_id, None)
+
+    async def _supervise(
+        self, destination_id: int, process: asyncio.subprocess.Process
+    ) -> int | None:
+        """Wait for the process, promoting to `forwarding` only once bytes move.
+
+        Also kills a wedged FFmpeg: the process can stay alive with an open
+        socket while no progress block has arrived for far longer than the
+        reporting period.
+        """
+        promoted = False
+        # One waiter for the whole run: re-wrapping process.wait() each tick
+        # would orphan a pending task every second.
+        waiter = asyncio.ensure_future(process.wait())
+        try:
+            while True:
+                done, _ = await asyncio.wait({waiter}, timeout=1.0)
+                if done:
+                    return waiter.result()
+                entry = self.metrics.get(destination_id) or {}
+                sampled = entry.get("sampled_at")
+                last = entry.get("last") or {}
+                # total_size is N/A for the tee muxer, so YouTube would never be
+                # promoted on bytes alone. frame and out_time come from PTS and
+                # are reported for every muxer.
+                moving = bool(last.get("total_bytes") or last.get("frames") or last.get("out_time_s"))
+                if not promoted and moving:
+                    promoted = True
+                    self._set_state(destination_id, "forwarding", None)
+                # sampled_at stays None until the first block lands, so keying
+                # the watchdog on it alone leaves an ffmpeg that hangs during the
+                # output handshake to sit on `connecting` forever — -timeout
+                # covers the RTSP input only. Fall back to the start stamp.
+                reference = sampled or entry.get("started_at")
+                if reference and time.monotonic() - reference > WORKER_STALL_SECONDS:
+                    log.warning("worker %s stopped reporting progress; restarting", destination_id)
+                    process.kill()
+                    return await waiter
+        finally:
+            if not waiter.done():
+                waiter.cancel()
 
 
 workers = WorkerManager()
+
+
+class SignalMetrics:
+    """Samples MediaMTX once per tick and keeps per-stream history in memory.
+
+    Every counter MediaMTX reports is cumulative per connection, so the whole
+    series is dropped whenever the SRT connection id changes — otherwise a
+    reconnect draws a negative spike. `bitrate` and `rtt` are passed through
+    from MediaMTX verbatim and are NOT derived here; only `bytes`/`moving_at`
+    are delta-tracked, and they feed `stalled_for`, never a display.
+    """
+
+    def __init__(self) -> None:
+        self.task: asyncio.Task | None = None
+        self.paths: dict[str, dict[str, Any]] = {}
+        self.publishers: dict[str, dict[str, Any]] = {}
+        self.readers: dict[str, int] = {}
+        self.history: dict[str, dict[str, Any]] = {}
+        self.sampled_at: float | None = None
+        self.reachable = False
+
+    async def start(self) -> None:
+        self.task = asyncio.create_task(self._loop())
+
+    async def shutdown(self) -> None:
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await self.sample()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.reachable = False
+                log.debug("metrics sample failed: %s", exc)
+            await asyncio.sleep(METRICS_INTERVAL_SECONDS)
+
+    @staticmethod
+    async def _items(client: httpx.AsyncClient, endpoint: str) -> list[dict[str, Any]]:
+        response = await client.get(f"{MEDIAMTX_API}{endpoint}", params={"itemsPerPage": 500})
+        response.raise_for_status()
+        return response.json().get("items", []) or []
+
+    async def sample(self) -> None:
+        async with httpx.AsyncClient(timeout=4) as client:
+            paths, srtconns, rtsp = await asyncio.gather(
+                self._items(client, "/v3/paths/list"),
+                self._items(client, "/v3/srtconns/list"),
+                self._items(client, "/v3/rtspsessions/list"),
+                return_exceptions=True,
+            )
+        if isinstance(paths, Exception):
+            raise paths
+        self.reachable = True
+        self.paths = {item.get("name"): item for item in paths if item.get("name")}
+        self.publishers = {}
+        if not isinstance(srtconns, Exception):
+            for item in srtconns:
+                if item.get("state") == "publish" and item.get("path"):
+                    self.publishers[item["path"]] = item
+        self.readers = {}
+        if not isinstance(rtsp, Exception):
+            for item in rtsp:
+                if item.get("path"):
+                    self.readers[item["path"]] = self.readers.get(item["path"], 0) + 1
+        self.sampled_at = time.monotonic()
+        for slug in self.paths:
+            self._record(slug)
+        for stale in set(self.history) - set(self.paths):
+            self.history.pop(stale, None)
+
+    def _record(self, slug: str) -> None:
+        path = self.paths.get(slug) or {}
+        conn = self.publishers.get(slug)
+        connection_id = conn.get("id") if conn else None
+        entry = self.history.get(slug)
+        if entry is None or entry["connection_id"] != connection_id:
+            entry = {
+                "connection_id": connection_id,
+                "bitrate": deque(maxlen=METRICS_SIGNAL_SAMPLES),
+                "rtt": deque(maxlen=METRICS_SIGNAL_SAMPLES),
+                "bytes": None,
+                "bytes_at": None,
+                "moving_at": time.monotonic(),
+            }
+            self.history[slug] = entry
+
+        received = path.get("inboundBytes")
+        if received is None:
+            received = path.get("bytesReceived")
+        moment = time.monotonic()
+        if isinstance(received, (int, float)):
+            if entry["bytes"] is not None and received > entry["bytes"]:
+                entry["moving_at"] = moment
+            entry["bytes"] = received
+            entry["bytes_at"] = moment
+
+        if conn:
+            rate = conn.get("mbpsReceiveRate")
+            if isinstance(rate, (int, float)):
+                entry["bitrate"].append(round(float(rate) * 1000, 1))
+            rtt = conn.get("msRTT")
+            if isinstance(rtt, (int, float)):
+                entry["rtt"].append(round(float(rtt), 1))
+
+    def stalled_for(self, slug: str) -> float | None:
+        """Seconds since the publisher last delivered bytes, if one is connected.
+
+        Gated on an actual SRT publisher rather than on the path being readable —
+        an always-available path is readable whether or not anyone is publishing,
+        so using that would kick a publisher that does not exist.
+        """
+        entry = self.history.get(slug)
+        if not entry or slug not in self.publishers or entry["bytes"] is None:
+            return None
+        return time.monotonic() - entry["moving_at"]
+
+    @staticmethod
+    def _describe_tracks(path: dict[str, Any]) -> list[str]:
+        described: list[str] = []
+        for track in path.get("tracks2") or []:
+            codec = track.get("codec") or "?"
+            props = track.get("codecProps") or {}
+            if props.get("width"):
+                described.append(
+                    f"{props['width']}×{props.get('height', '?')} {codec}"
+                    + (f" {props['profile']}" if props.get("profile") else "")
+                )
+            elif props.get("sampleRate"):
+                channels = props.get("channelCount")
+                described.append(
+                    f"{codec} {int(props['sampleRate']) // 1000} kHz"
+                    + (" stereo" if channels == 2 else f" {channels}ch" if channels else "")
+                )
+            else:
+                described.append(str(codec))
+        if described:
+            return described
+        return [str(item) for item in (path.get("tracks") or [])]
+
+    def snapshot(self, slug: str) -> dict[str, Any]:
+        path = self.paths.get(slug) or {}
+        conn = self.publishers.get(slug) or {}
+        entry = self.history.get(slug) or {}
+        loss_rate = conn.get("packetsReceivedLossRate")
+        return {
+            "known": self.reachable,
+            "publishing": bool(conn),
+            "rtt_ms": conn.get("msRTT"),
+            "receive_mbps": conn.get("mbpsReceiveRate"),
+            "link_capacity_mbps": conn.get("mbpsLinkCapacity"),
+            # Already a percentage from MediaMTX; scaling it again read 100x high
+            # and tripped the "Degraded" chip at a hundredth of the real loss.
+            "loss_rate": round(float(loss_rate), 3) if isinstance(loss_rate, (int, float)) else None,
+            "packets_lost": conn.get("packetsReceivedLoss"),
+            "packets_retransmitted": conn.get("packetsReceivedRetrans"),
+            "packets_dropped": conn.get("packetsReceivedDrop"),
+            "packets_belated": conn.get("packetsReceivedBelated"),
+            "receive_buffer_ms": conn.get("msReceiveBuf"),
+            "latency_ms": conn.get("msReceiveTsbPdDelay"),
+            "frames_in_error": path.get("inboundFramesInError"),
+            "bytes_received": entry.get("bytes"),
+            "online_since": path.get("onlineTime") or path.get("readyTime"),
+            "reader_count": self.readers.get(slug, 0),
+            "track_summary": self._describe_tracks(path),
+            "stalled_for_s": (
+                round(self.stalled_for(slug), 1) if self.stalled_for(slug) is not None else None
+            ),
+            "series": {
+                "bitrate_kbps": list(entry.get("bitrate") or [])[-METRICS_SERIES_POINTS:],
+                "rtt_ms": list(entry.get("rtt") or [])[-METRICS_SERIES_POINTS:],
+            },
+        }
+
+
+signal_metrics = SignalMetrics()
 
 
 class FailoverAdManager:
     def __init__(self) -> None:
         self.task: asyncio.Task | None = None
         self.states: dict[int, dict[str, Any]] = {}
+        self.kicks: dict[int, float] = {}
+        self.probes: dict[int, float] = {}
         self.last_token_sweep = 0.0
 
     async def start(self) -> None:
@@ -1287,13 +2404,59 @@ class FailoverAdManager:
             except Exception:
                 pass
 
+    async def _enforce_fast_failover(self, stream: sqlite3.Row) -> None:
+        """Drop a publisher that has gone silent, instead of waiting it out.
+
+        MediaMTX only notices a vanished SRT publisher after its peer-idle
+        timeout, and it then adds the entire dead interval to the first slate
+        frame's timestamp — so detection latency is re-presented to viewers
+        one-for-one. Kicking the stalled connection collapses that wait.
+
+        Opt-in per stream, because the threshold must stay above the negotiated
+        SRT latency plus retransmission bursts or it will drop healthy feeds.
+        """
+        if not fast_failover_enabled(stream["id"]):
+            return
+        if current_program_mode(stream["id"]) != "live":
+            return
+        stalled = signal_metrics.stalled_for(stream["slug"])
+        if stalled is None or stalled < FAST_FAILOVER_STALL_SECONDS:
+            return
+        if time.monotonic() - self.kicks.get(stream["id"], 0.0) < 10:
+            return
+        self.kicks[stream["id"]] = time.monotonic()
+        log.info("fast failover: dropping stalled publisher on %s after %.1fs", stream["slug"], stalled)
+        await kick_stream_publishers(stream["slug"])
+
     async def _prepare_brb(self, stream: sqlite3.Row) -> None:
+        await self._learn_contribution(stream)
         if not media_asset_path(stream["slug"], "brb").exists():
             return
         try:
             await activate_screen_file(stream, "brb", reload_path=False)
         except Exception:
             pass
+
+    async def _learn_contribution(self, stream: sqlite3.Row) -> None:
+        """Record what this streamer's encoder actually produces.
+
+        Runs on the offline-to-online edge, so each user's failover screens are
+        built to match their own feed rather than one reference setup. Probing is
+        cheap and rate-limited to once per online transition.
+        """
+        if time.monotonic() - self.probes.get(stream["id"], 0.0) < 300:
+            return
+        self.probes[stream["id"]] = time.monotonic()
+        profile = await probe_contribution(stream["slug"])
+        if not profile:
+            return
+        if store_contribution_profile(stream["id"], profile):
+            log.info(
+                "contribution profile for %s: %sx%s @%.3ffps gop=%.2fs %s L%s refs=%s bframes=%s",
+                stream["slug"], profile["width"], profile["height"], profile["fps"],
+                profile["gop_seconds"], profile["profile"], profile["level"],
+                profile["refs"], profile["bframes"],
+            )
 
     async def _loop(self) -> None:
         while True:
@@ -1311,6 +2474,12 @@ class FailoverAdManager:
                     self.states.pop(stale, None)
                 for stream in streams:
                     media = await media_status(stream["slug"])
+                    if not media.get("known", True):
+                        # MediaMTX was unreachable this tick. Holding the previous
+                        # state is the only safe reading: treating it as an
+                        # outage would fire an ad and re-copy the screen.
+                        continue
+                    await self._enforce_fast_failover(stream)
                     online = bool(media["online"])
                     state = self.states.setdefault(
                         stream["id"],
@@ -1331,8 +2500,18 @@ class FailoverAdManager:
                         state["manual_override"] = True
                         continue
                     if state["manual_override"]:
-                        state["last_online"] = True
+                        # Returning to live input is not an outage. Recording
+                        # last_online=True while OBS is still absent made the
+                        # next tick look like a drop and ran a real commercial on
+                        # a channel that never went down.
+                        state["last_online"] = online
+                        state["outage_started"] = None
+                        state["outage_started_at"] = None
+                        state["attempted"] = False
                         state["manual_override"] = False
+                        if online:
+                            await self._prepare_brb(stream)
+                        continue
                     if state["last_online"] is None:
                         state["last_online"] = online
                         if online:
@@ -1369,12 +2548,21 @@ failover_ads = FailoverAdManager()
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     initialize_db()
+    # MediaMTX will not start until its always-available file exists, and its
+    # health gate depends on this process, so the slate must be in place before
+    # the router reports ready.
+    await ensure_bootstrap_media()
+    # Use the last known ingest immediately; probing every Twitch PoP takes tens
+    # of seconds and must not delay forwarding or MediaMTX's health gate.
+    twitch_ingests.load_saved()
     await path_reconciler.start()
-    await twitch_ingests.start()
+    await signal_metrics.start()
     await workers.start_enabled()
     await failover_ads.start()
+    await twitch_ingests.start(probe_now=False)
     yield
     await failover_ads.shutdown()
+    await signal_metrics.shutdown()
     await path_reconciler.shutdown()
     await media_conversions.shutdown()
     await workers.shutdown()
@@ -1554,6 +2742,9 @@ async def team_state(request: Request) -> dict[str, Any]:
                       (SELECT COUNT(*) FROM destinations d
                        WHERE d.stream_id = s.id AND d.enabled = 1)
                           AS enabled_destination_count,
+                      (SELECT COUNT(*) FROM destinations d
+                       WHERE d.stream_id = s.id AND d.enabled = 1 AND d.state = 'forwarding')
+                          AS forwarding_count,
                       EXISTS(SELECT 1 FROM twitch_connections t WHERE t.user_id = u.id)
                           AS twitch_connected
                FROM users u JOIN streams s ON s.user_id = u.id
@@ -1573,6 +2764,12 @@ async def team_state(request: Request) -> dict[str, Any]:
                 **dict(member),
                 "enabled": bool(member["enabled"]),
                 "twitch_connected": bool(member["twitch_connected"]),
+                # Fleet health only. Per-stream detail stays on /api/state so the
+                # isolation boundary is unchanged.
+                "online": bool((signal_metrics.paths.get(member["slug"]) or {}).get("ready")),
+                "receive_mbps": (signal_metrics.publishers.get(member["slug"]) or {}).get(
+                    "mbpsReceiveRate"
+                ),
             }
             for member in members
         ],
@@ -1837,33 +3034,71 @@ async def change_screen_mode(body: ScreenModeBody, request: Request) -> dict[str
     stream = stream_for_user(user["id"])
     status = await media_status(stream["slug"])
     if body.mode == "live":
-        await activate_screen_file(stream, "brb", reload_path=not status["online"])
+        previous = current_program_mode(stream["id"])
         set_program_mode(stream["id"], "live")
+        try:
+            await activate_screen_file(stream, "brb", reload_path=not status["online"])
+        except Exception:
+            # Do not leave OBS admitted while the screen it would fall back to
+            # failed to activate.
+            set_program_mode(stream["id"], previous)
+            raise
         return {"status": "live"}
 
-    await activate_screen_file(stream, body.mode, reload_path=not status["online"])
+    if not media_asset_path(stream["slug"], body.mode).exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Upload the {body.mode.replace('_', ' ')} screen first",
+        )
+    previous = current_program_mode(stream["id"])
+    # Close the publish gate before the file swap. mediamtx_auth only admits a
+    # publisher while the program mode is "live", so setting it first means an
+    # OBS reconnect landing mid-swap is rejected rather than silently put to air.
     set_program_mode(stream["id"], body.mode)
-    if status["online"]:
-        await kick_stream_publishers(stream["slug"])
+    try:
+        await activate_screen_file(stream, body.mode, reload_path=not status["online"])
+    except Exception:
+        set_program_mode(stream["id"], previous)
+        raise
+    # Unconditionally, not just when the pre-swap sample said "online".
+    await kick_stream_publishers(stream["slug"])
     return {"status": body.mode}
 
+def _path_state(path: dict[str, Any] | None) -> dict[str, Any]:
+    if not path:
+        return {"known": True, "available": False, "online": False, "tracks": []}
+    return {
+        "known": True,
+        "available": True,
+        # Must be "online", not "ready": for an always-available path "ready" is
+        # permanently true because the slate file can always be read, so it says
+        # nothing about whether OBS is publishing.
+        "online": bool(path.get("online", path.get("ready"))),
+        "tracks": path.get("tracks", []),
+        "tracks2": path.get("tracks2", []),
+        "bytes_received": path.get("inboundBytes", path.get("bytesReceived", 0)),
+    }
+
+
 async def media_status(slug: str) -> dict[str, Any]:
+    """Current MediaMTX view of one path.
+
+    `known` distinguishes "MediaMTX says there is no publisher" from "MediaMTX
+    could not be reached", which callers must not confuse: treating a transport
+    hiccup as an outage triggers ads and screen copies mid-broadcast.
+    """
+    if signal_metrics.sampled_at is not None and (
+        time.monotonic() - signal_metrics.sampled_at < METRICS_INTERVAL_SECONDS * 3
+    ):
+        return _path_state(signal_metrics.paths.get(slug))
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            response = await client.get(f"{MEDIAMTX_API}/v3/paths/list")
+            response = await client.get(f"{MEDIAMTX_API}/v3/paths/list", params={"itemsPerPage": 500})
             response.raise_for_status()
             items = response.json().get("items", [])
-        path = next((item for item in items if item.get("name") == slug), None)
-        if not path:
-            return {"available": False, "online": False, "tracks": []}
-        return {
-            "available": True,
-            "online": bool(path.get("online")),
-            "tracks": path.get("tracks", []),
-            "bytes_received": path.get("bytesReceived", 0),
-        }
+        return _path_state(next((item for item in items if item.get("name") == slug), None))
     except Exception:
-        return {"available": False, "online": False, "tracks": []}
+        return {"known": False, "available": False, "online": False, "tracks": []}
 
 
 @app.get("/api/state")
@@ -1872,20 +3107,42 @@ async def state(request: Request) -> dict[str, Any]:
     stream = stream_for_user(user["id"])
     with connect() as conn:
         destinations = conn.execute(
-            "SELECT id, name, platform, audio_track, enabled, state, last_error FROM destinations WHERE stream_id = ? ORDER BY id",
+            """SELECT id, name, platform, enabled, state, last_error,
+                      restart_count, last_started_at, music_fallback
+               FROM destinations WHERE stream_id = ? ORDER BY id""",
             (stream["id"],),
         ).fetchall()
-    publish_password = decrypt(stream["publish_password_enc"])
+    try:
+        publish_password = decrypt(stream["publish_password_enc"])
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Stored credentials cannot be decrypted. Check that FERNET_KEY matches this data volume.",
+        )
     stream_id = f"publish:{stream['slug']}:{stream['publish_user']}:{publish_password}"
     obs_url = f"srt://{PUBLIC_HOST}:{SRT_PORT}?streamid={stream_id}&pkt_size=1316&latency=500000"
+    if "csrf" not in request.session:
+        request.session["csrf"] = secrets.token_urlsafe(24)
+    outputs = []
+    for row in destinations:
+        entry = dict(row)
+        entry["metrics"] = workers.snapshot(row["id"]) if row["enabled"] else workers.snapshot(-1)
+        outputs.append(entry)
     return {
         "user": {"username": user["username"], "display_name": user["display_name"], "role": user["role"]},
         "csrf": request.session["csrf"],
-        "stream": {"slug": stream["slug"], "obs_url": obs_url, "media": await media_status(stream["slug"])},
+        "stream": {
+            "slug": stream["slug"],
+            "obs_url": obs_url,
+            "media": await media_status(stream["slug"]),
+            "signal": signal_metrics.snapshot(stream["slug"]),
+            "fast_failover": fast_failover_enabled(stream["id"]),
+            "fast_failover_seconds": FAST_FAILOVER_STALL_SECONDS,
+        },
         "twitch_ingest": twitch_ingests.selection,
         "twitch": twitch_state(user["id"], stream["id"]),
         "screens": media_assets_state(stream),
-        "destinations": [dict(row) for row in destinations],
+        "destinations": outputs,
     }
 
 
@@ -1894,13 +3151,60 @@ def validate_output_url(value: str) -> None:
         raise HTTPException(status_code=422, detail="Destination must use an RTMP or RTMPS address")
 
 
+PLATFORM_LABELS = {"twitch": "Twitch", "youtube": "YouTube", "rplay": "RPLAY", "x": "X"}
+
+
 def validate_stream_key(value: str, platform: str) -> None:
+    label = PLATFORM_LABELS.get(platform, platform)
     if value.startswith(("rtmp://", "rtmps://")) or any(character.isspace() for character in value):
-        raise HTTPException(status_code=422, detail=f"Paste only the {platform} stream key, not an RTMP address")
+        raise HTTPException(status_code=422, detail=f"Paste only the {label} stream key, not an RTMP address")
     if len(value) < 12:
-        raise HTTPException(status_code=422, detail=f"That {platform} stream key looks incomplete")
-    if platform == "YouTube" and not re.fullmatch(r"[A-Za-z0-9-]+", value):
-        raise HTTPException(status_code=422, detail="That YouTube stream key contains unexpected characters")
+        raise HTTPException(status_code=422, detail=f"That {label} stream key looks incomplete")
+    # A key containing URL syntax would be interpolated into the ingest address
+    # and could silently redirect the stream or destroy query parameters.
+    if not re.fullmatch(r"[A-Za-z0-9_.:%-]+", value):
+        raise HTTPException(status_code=422, detail=f"That {label} stream key contains unexpected characters")
+
+
+def validate_music_fallback(enabled: bool, platform: str) -> None:
+    """Only YouTube and X have a music fallback to choose.
+
+    Every other platform maps track 1 whatever this says, so storing True there
+    would read back as an ON control in the dashboard that changes nothing —
+    and on this particular setting a wrong belief about what is being published
+    is the whole failure mode. Reject rather than silently ignore. False is
+    harmless everywhere, so it is accepted for any platform.
+
+    Only a value the caller actually sent reaches here. The stored default is
+    now on, so a create request that never mentioned the flag must not be
+    judged as if it had asked for it; resolve_music_fallback() is the guard.
+    """
+    if enabled and platform not in {"youtube", "x"}:
+        raise HTTPException(
+            status_code=422,
+            detail="The music fallback only applies to YouTube and X destinations",
+        )
+
+
+def resolve_music_fallback(requested: bool | None, platform: str) -> bool:
+    """Validate an explicit music-fallback choice, resolve an omitted one.
+
+    Flipping the stored default to on made the naive spelling a trap: with
+    `music_fallback: bool = True` on the request model, a plain Twitch, RPLAY or
+    custom create carries True into validate_music_fallback and 422s on a field
+    the form never sent. Keeping the model field tri-state separates "chose
+    True" from "chose nothing", so an explicit True on a platform that ignores
+    the flag is still rejected instead of quietly stored.
+
+    An omitted flag resolves to the platform's own default: on for the
+    clean-track platforms, where the choice exists, and off for the ones that
+    map track 1 regardless. A stored 1 therefore always means a live YouTube or
+    X opt-in, never a value left over on a destination that cannot act on it.
+    """
+    if requested is None:
+        return platform in {"youtube", "x"}
+    validate_music_fallback(requested, platform)
+    return requested
 
 
 @app.post("/api/destinations", status_code=201)
@@ -1908,16 +3212,22 @@ async def add_destination(body: DestinationBody, request: Request) -> dict[str, 
     user = require_user(request)
     require_csrf(request)
     if body.platform in {"twitch", "youtube", "rplay", "x"}:
-        validate_stream_key(body.output_url.strip(), body.platform.capitalize())
+        validate_stream_key(body.output_url.strip(), body.platform)
     else:
         validate_output_url(body.output_url.strip())
-    if body.audio_track == 3 and body.platform != "twitch":
-        raise HTTPException(status_code=422, detail="The separate Twitch VOD track is only available for Twitch")
+    music_fallback = resolve_music_fallback(body.music_fallback, body.platform)
     stream = stream_for_user(user["id"])
     with connect() as conn:
         cursor = conn.execute(
-            "INSERT INTO destinations(stream_id, name, platform, output_url_enc, audio_track, created_at) VALUES(?,?,?,?,?,?)",
-            (stream["id"], body.name.strip(), body.platform, encrypt(body.output_url.strip()), body.audio_track, now()),
+            "INSERT INTO destinations(stream_id, name, platform, output_url_enc, music_fallback, created_at) VALUES(?,?,?,?,?,?)",
+            (
+                stream["id"],
+                body.name.strip(),
+                body.platform,
+                encrypt(body.output_url.strip()),
+                int(music_fallback),
+                now(),
+            ),
         )
     return {"id": cursor.lastrowid}
 
@@ -1939,24 +3249,96 @@ async def toggle_destination(destination_id: int, body: ToggleBody, request: Req
     return {"status": "enabled" if body.enabled else "disabled"}
 
 
+@app.patch("/api/destinations/{destination_id}/music-fallback")
+async def set_destination_music_fallback(
+    destination_id: int, body: MusicFallbackBody, request: Request
+) -> dict[str, str]:
+    user = require_user(request)
+    require_csrf(request)
+    stream = stream_for_user(user["id"])
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, platform FROM destinations WHERE id = ? AND stream_id = ?",
+            (destination_id, stream["id"]),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Destination not found")
+        validate_music_fallback(body.enabled, row["platform"])
+        conn.execute(
+            "UPDATE destinations SET music_fallback = ? WHERE id = ? AND stream_id = ?",
+            (int(body.enabled), destination_id, stream["id"]),
+        )
+    # Deliberately no restart: the audio map is fixed when the worker's ffmpeg
+    # starts, so a running destination keeps its current mapping until the next
+    # start. Restarting from a settings toggle would drop a live output without
+    # the confirmation the dashboard puts in front of stopping one.
+    return {"status": "enabled" if body.enabled else "disabled"}
+
+
+@app.post("/api/destinations/{destination_id}/restart")
+async def restart_destination(destination_id: int, request: Request) -> dict[str, str]:
+    user = require_user(request)
+    require_csrf(request)
+    stream = stream_for_user(user["id"])
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, enabled FROM destinations WHERE id = ? AND stream_id = ?",
+            (destination_id, stream["id"]),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    if not row["enabled"]:
+        raise HTTPException(status_code=409, detail="Turn this destination on first")
+    await workers.stop(destination_id, abrupt=True)
+    with connect() as conn:
+        conn.execute("UPDATE destinations SET state = 'connecting' WHERE id = ?", (destination_id,))
+    workers.start(destination_id)
+    return {"status": "restarting"}
+
+
+@app.patch("/api/stream/fast-failover")
+async def set_stream_fast_failover(body: FastFailoverBody, request: Request) -> dict[str, str]:
+    user = require_user(request)
+    require_csrf(request)
+    stream = stream_for_user(user["id"])
+    set_fast_failover(stream["id"], body.enabled)
+    return {"status": "enabled" if body.enabled else "disabled"}
+
+
 @app.delete("/api/destinations/{destination_id}", status_code=204)
 async def delete_destination(destination_id: int, request: Request) -> Response:
     user = require_user(request)
     require_csrf(request)
     stream = stream_for_user(user["id"])
-    await workers.stop(destination_id)
+    # The ownership-scoped delete must happen first: workers.stop() takes a raw
+    # destination id with no stream predicate, so stopping before verifying let
+    # any signed-in user kill another user's live output.
     with connect() as conn:
-        conn.execute("DELETE FROM destinations WHERE id = ? AND stream_id = ?", (destination_id, stream["id"]))
+        cursor = conn.execute(
+            "DELETE FROM destinations WHERE id = ? AND stream_id = ?",
+            (destination_id, stream["id"]),
+        )
+        deleted = cursor.rowcount
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Destination not found")
+    await workers.stop(destination_id)
     return Response(status_code=204)
 
 
 @app.post("/internal/mediamtx-auth")
 async def mediamtx_auth(request: Request) -> Response:
-    payload = await request.json()
-    action = payload.get("action", "")
-    path = payload.get("path", "")
-    user = payload.get("user", "")
-    password = payload.get("password", "")
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "Forbidden"}, status_code=403)
+    if not isinstance(payload, dict):
+        return JSONResponse({"detail": "Forbidden"}, status_code=403)
+    # compare_digest raises on non-str input, which would surface as a 500 and be
+    # far less obvious than a denial.
+    action = payload.get("action") if isinstance(payload.get("action"), str) else ""
+    path = payload.get("path") if isinstance(payload.get("path"), str) else ""
+    user = payload.get("user") if isinstance(payload.get("user"), str) else ""
+    password = payload.get("password") if isinstance(payload.get("password"), str) else ""
     if action == "api":
         return Response(status_code=204)
     if action in {"read", "playback"} and secrets.compare_digest(user, MEDIA_INTERNAL_USER) and secrets.compare_digest(password, MEDIA_INTERNAL_PASS):
@@ -1981,6 +3363,10 @@ async def mediamtx_auth(request: Request) -> Response:
 async def media_proxy(media_path: str, request: Request) -> Response:
     user = require_user(request)
     stream = stream_for_user(user["id"])
+    # Reject traversal and encoded separators before the prefix test, so
+    # "<slug>/../<other slug>/index.m3u8" cannot escape the caller's stream.
+    if ".." in media_path or "\\" in media_path or "%2e" in media_path.lower():
+        raise HTTPException(status_code=403, detail="This monitor belongs to another stream")
     if not (media_path == stream["slug"] or media_path.startswith(stream["slug"] + "/")):
         raise HTTPException(status_code=403, detail="This monitor belongs to another stream")
     if media_path == stream["slug"]:

@@ -43,9 +43,10 @@ Schema creation and lightweight migrations currently live in `init_db()` in `rou
 2. Validate the input in the router.
 3. Construct the output URL only inside the worker, after decrypting the stored secret.
 4. Keep the final URL and key out of logs/errors.
-5. Add a recognizable local logo with accessible labeling.
-6. Add tests for validation, persistence, audio restrictions, and worker URL construction.
-7. Document platform-specific ingest and audio behavior.
+5. Decide the platform's audio routing in `build_audio_args`: track 1 is the full live mix, track 2 the clean mix, and the choice belongs to the platform, never to the user. Decide the one-track degrade with it. A platform whose archive is public or scanned takes track 2 normally and falls back to track 1 when the publisher sends only one, because dropping the audio map emits FLV with no audio track at all and no ingest is assumed to accept that; the destination's `music_fallback` flag defaults to on for that group, and clearing it is the opt-out that mutes the destination instead. If the new platform belongs there, add it to the clean-track set in `build_audio_args`, `validate_music_fallback`, and `resolve_music_fallback` together, and make sure the dashboard shows its degraded routing — that display is the compensating control for the fallback default. Every other platform maps track 1 in both the normal and the degraded case and must reject an explicit `music_fallback: true` rather than store a control that does nothing.
+6. Add a recognizable local logo with accessible labeling.
+7. Add tests for validation, persistence, audio mapping, and worker URL construction.
+8. Document platform-specific ingest and audio behavior.
 
 ## Release checklist
 
