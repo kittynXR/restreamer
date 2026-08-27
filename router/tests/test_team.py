@@ -275,7 +275,15 @@ class TeamInvitationFlowTest(unittest.TestCase):
         owner_brb = main.media_asset_path("studio", "brb")
         owner_brb.write_bytes(b"test-fallback")
         main.media_asset_path("studio", "starting_soon").write_bytes(b"test-starting")
-        main.ensure_default_media_template()
+        # Seeding now hands each stream the cached slate for its own geometry
+        # rather than copying whatever another tenant uploaded, so stand in for
+        # the variant ensure_slate_variants() would have rendered (there is no
+        # ffmpeg in the test environment).
+        self.slate_variant = main.slate_variant_path(
+            main.snap_slate_variant(dict(main.DEFAULT_CONTRIBUTION))
+        )
+        self.slate_variant.parent.mkdir(parents=True, exist_ok=True)
+        self.slate_variant.write_bytes(b"test-slate-variant")
 
         owner_session = self.client.get("/api/session").json()
         owner_csrf = owner_session["csrf"]
@@ -598,8 +606,15 @@ class TeamInvitationFlowTest(unittest.TestCase):
                    WHERE u.username = 'partner'"""
             ).fetchone()
         self.assertIsNotNone(partner)
-        self.assertTrue(main.media_asset_path(partner["slug"], "brb").exists())
+        partner_brb = main.media_asset_path(partner["slug"], "brb")
+        self.assertTrue(partner_brb.exists())
         self.assertTrue(main.active_media_path(partner["slug"]).exists())
+        # The invited member gets the generated slate for their geometry, never
+        # the owner's uploaded screen. Copying it across tenants both leaked one
+        # operator's card onto another's channel and handed them the wrong
+        # resolution.
+        self.assertEqual(partner_brb.read_bytes(), b"test-slate-variant")
+        self.assertNotEqual(partner_brb.read_bytes(), owner_brb.read_bytes())
 
         self.client.post(
             "/api/logout",

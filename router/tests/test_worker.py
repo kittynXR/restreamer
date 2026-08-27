@@ -536,6 +536,99 @@ class RedactionTest(unittest.TestCase):
         self.assertEqual(main.redact("plain text", None), "plain text")
 
 
+
+class SlateVariantTest(unittest.TestCase):
+    """Which failover slate a stream is handed.
+
+    A slate that does not match the feed's geometry changes resolution or cadence
+    mid-stream underneath `-c:v copy` every time OBS reconnects. Production ran
+    for days with a single 720p48 slate standing in for two 1080p feeds, so these
+    assert the mapping rather than trusting it.
+    """
+
+    def profile(self, **over):
+        return {**main.DEFAULT_CONTRIBUTION, **over}
+
+    def test_every_supported_geometry_maps_to_itself(self) -> None:
+        for width, height, fps in main.SLATE_VARIANTS:
+            self.assertEqual(
+                main.snap_slate_variant(self.profile(width=width, height=height, fps=fps)),
+                (width, height, fps),
+                f"{width}x{height}p{fps:g}",
+            )
+
+    def test_the_two_production_feeds_get_their_own_geometry(self) -> None:
+        # studio probes 1080p48; the second tenant probes 1080p60. Both were
+        # being served the same 720p48 file.
+        self.assertEqual(
+            main.snap_slate_variant(self.profile(width=1920, height=1080, fps=48.0)),
+            (1920, 1080, 48.0),
+        )
+        self.assertEqual(
+            main.snap_slate_variant(self.profile(width=1920, height=1080, fps=60.0)),
+            (1920, 1080, 60.0),
+        )
+
+    def test_height_decides_before_frame_rate(self) -> None:
+        """A resolution change at the splice forces a decoder reconfiguration;
+        a cadence change only makes the segmenter re-anchor. So a 1080p25 feed
+        must land on 1080, not on the 720 variant with the nearer frame rate."""
+        self.assertEqual(
+            main.snap_slate_variant(self.profile(height=1080, fps=25.0)), (1920, 1080, 30.0)
+        )
+        self.assertEqual(
+            main.snap_slate_variant(self.profile(height=720, fps=59.94)), (1280, 720, 60.0)
+        )
+
+    def test_unsupported_shapes_snap_to_the_nearest(self) -> None:
+        for height, fps, expected in (
+            (1440, 60.0, (1920, 1080, 60.0)),   # closer to 1080 than to 720
+            (900, 30.0, (1920, 1080, 30.0)),    # exact tie: 180 lines either way, resolves up
+            (480, 30.0, (1280, 720, 30.0)),
+            (2160, 48.0, (1920, 1080, 48.0)),
+            (1080, 24.0, (1920, 1080, 30.0)),
+            (1080, 50.0, (1920, 1080, 48.0)),
+            (1080, 55.0, (1920, 1080, 60.0)),
+        ):
+            self.assertEqual(
+                main.snap_slate_variant(self.profile(height=height, fps=fps)), expected,
+                f"{height}p{fps:g}",
+            )
+
+    def test_exact_ties_resolve_upward_by_rule_not_by_list_order(self) -> None:
+        """900p is 180 lines from both 720 and 1080, and 54 fps is 6 from both 48
+        and 60. Without an explicit rule the answer is whichever entry happens to
+        come first in SLATE_VARIANTS, which is not a decision anyone made."""
+        self.assertEqual(
+            main.snap_slate_variant(self.profile(height=900, fps=30.0)), (1920, 1080, 30.0)
+        )
+        self.assertEqual(
+            main.snap_slate_variant(self.profile(height=1080, fps=54.0)), (1920, 1080, 60.0)
+        )
+
+    def test_missing_or_junk_values_fall_back_to_the_defaults(self) -> None:
+        """The profile is read back out of app_settings, so it can be absent or
+        malformed; snapping must still produce a usable geometry."""
+        default = main.snap_slate_variant(dict(main.DEFAULT_CONTRIBUTION))
+        for bad in ({"height": None}, {"fps": None}, {"height": "wide"}, {"fps": "fast"}, {}):
+            self.assertEqual(main.snap_slate_variant({**main.DEFAULT_CONTRIBUTION, **bad}), default)
+        self.assertEqual(main.snap_slate_variant({}), default)
+
+    def test_each_geometry_gets_its_own_cached_file(self) -> None:
+        paths = {main.slate_variant_path(v) for v in main.SLATE_VARIANTS}
+        self.assertEqual(len(paths), len(main.SLATE_VARIANTS), "variants must not share a file")
+        self.assertEqual(
+            main.slate_variant_path((1920, 1080, 48.0)).name, "slate-1920x1080p48.mp4"
+        )
+
+    def test_the_slate_recipe_never_emits_b_frames(self) -> None:
+        """The file in production carried has_b_frames=2. B-frames make PTS != DTS,
+        which the FLV muxer rejects, so no slate may have them whatever the feed does."""
+        args = main.slate_encode_args({**main.DEFAULT_CONTRIBUTION, "bframes": 3})
+        self.assertIn("-bf", args)
+        self.assertEqual(args[args.index("-bf") + 1], "0")
+
+
 class ProgressParsingTest(unittest.TestCase):
     # Everything one -progress block is normalised into, written out in full
     # because the absence is the point: `bitrate_kbps` is not here. ffmpeg's

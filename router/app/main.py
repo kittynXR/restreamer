@@ -102,6 +102,21 @@ DEFAULT_CONTRIBUTION: dict[str, Any] = {
 }
 CONTRIBUTION_FPS_RANGE = (10.0, 120.0)
 CONTRIBUTION_PROBE_SECONDS = 4
+
+# A failover slate only splices cleanly when it matches the geometry of the feed
+# it stands in for: hand a 1080p60 stream a 720p48 slate and every OBS reconnect
+# changes resolution and frame rate mid-stream underneath `-c:v copy`. Rather
+# than encode a bespoke file per stream, one slate is cached per supported
+# geometry and each stream is handed the closest match. Anything a streamer
+# actually publishes snaps to one of these.
+SLATE_VARIANTS: tuple[tuple[int, int, float], ...] = (
+    (1280, 720, 30.0),
+    (1280, 720, 48.0),
+    (1280, 720, 60.0),
+    (1920, 1080, 30.0),
+    (1920, 1080, 48.0),
+    (1920, 1080, 60.0),
+)
 # ffprobe reports human-readable profile names ("High 4:2:2 Predictive") that are
 # not valid libx264 profile arguments, so probed values are mapped to the set
 # x264 accepts and anything unrecognised falls back to high.
@@ -317,8 +332,6 @@ def initialize_db() -> None:
         conn.execute(
             "UPDATE media_assets SET status = 'error', message = 'Conversion was interrupted; upload the file again.' WHERE status = 'converting'"
         )
-    ensure_default_media_template()
-
 
 def encrypt(value: str) -> str:
     return FERNET.encrypt(value.encode()).decode()
@@ -997,7 +1010,59 @@ def slate_encode_args(profile: dict[str, Any]) -> list[str]:
     ]
 
 
-async def generate_placeholder_slate(target: Path) -> bool:
+def snap_slate_variant(profile: dict[str, Any]) -> tuple[int, int, float]:
+    """The supported slate geometry closest to an observed contribution profile.
+
+    Height decides first and frame rate breaks the tie: a resolution change at
+    the splice is what forces a decoder reconfiguration, while a frame-rate
+    change is merely a cadence the segmenter has to re-anchor on.
+
+    An exact tie (900p sits 180 lines from both 720 and 1080) resolves upward, so
+    the choice is a stated rule rather than an accident of list order. Scaling a
+    larger slate down costs nothing; the level and bitrate are already sized for
+    the bigger geometry either way.
+    """
+    def number(key: str, cast):
+        try:
+            value = profile.get(key)
+            return cast(DEFAULT_CONTRIBUTION[key] if value is None else value)
+        except (TypeError, ValueError):
+            return cast(DEFAULT_CONTRIBUTION[key])
+
+    height, fps = number("height", int), number("fps", float)
+    return min(
+        SLATE_VARIANTS,
+        key=lambda v: (abs(v[1] - height), -v[1], abs(v[2] - fps), -v[2]),
+    )
+
+
+def slate_variant_path(variant: tuple[int, int, float]) -> Path:
+    width, height, fps = variant
+    return DB_PATH.parent / "media" / "_default" / f"slate-{width}x{height}p{fps:g}.mp4"
+
+
+def stream_slate_variant(slug: str) -> tuple[int, int, float]:
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM streams WHERE slug = ?", (slug,)).fetchone()
+    profile = contribution_profile(row["id"]) if row else dict(DEFAULT_CONTRIBUTION)
+    return snap_slate_variant(profile)
+
+
+def has_uploaded_screen(stream_id: int, kind: str) -> bool:
+    """True when this screen is the user's own upload rather than a seeded slate.
+
+    Seeded slates are ours to replace when the feed changes shape. An uploaded
+    one is the user's content; MediaConversionManager re-encodes that against the
+    stream's full profile instead.
+    """
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM media_assets WHERE stream_id = ? AND kind = ?", (stream_id, kind)
+        ).fetchone()
+    return row is not None
+
+
+async def generate_placeholder_slate(target: Path, profile: dict[str, Any] | None = None) -> bool:
     """Render a plain standby card so a fresh install has a usable slate.
 
     MediaMTX opens `alwaysAvailableFile` when it loads its configuration, so on a
@@ -1005,7 +1070,10 @@ async def generate_placeholder_slate(target: Path) -> bool:
     be a file at that path or the media server cannot start.
     """
     pending = target.with_suffix(".bootstrap.mp4")
-    profile = dict(DEFAULT_CONTRIBUTION)
+    # Geometry comes from the caller; everything else that lands in the SPS keeps
+    # the conservative defaults, because one variant is shared by every stream
+    # that snaps to it and cannot carry any single stream's refs or level.
+    profile = {**DEFAULT_CONTRIBUTION, **(profile or {})}
     width, height = int(profile["width"]), int(profile["height"])
     command = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
@@ -1044,52 +1112,106 @@ async def generate_placeholder_slate(target: Path) -> bool:
         return False
 
 
+async def ensure_slate_variants() -> None:
+    """Render any supported slate geometry a current stream needs.
+
+    Each variant is rendered once and shared by every stream that snaps to it, so
+    this is a no-op on all but the first boot after a feed changes shape.
+    """
+    with connect() as conn:
+        ids = [row["id"] for row in conn.execute("SELECT id FROM streams")]
+    wanted = {snap_slate_variant(contribution_profile(i)) for i in ids}
+    # The generated OBS path exists before its stream row does, so the default
+    # geometry always has to be on disk.
+    wanted.add(snap_slate_variant(dict(DEFAULT_CONTRIBUTION)))
+    for variant in sorted(wanted):
+        target = slate_variant_path(variant)
+        if target.exists():
+            continue
+        width, height, fps = variant
+        if await generate_placeholder_slate(
+            target, {"width": width, "height": height, "fps": fps}
+        ):
+            log.info("rendered slate variant %sx%sp%g", width, height, fps)
+
+
+def replace_seeded_slate(source: Path, brb: Path, active: Path) -> None:
+    """Swap a seeded slate without ever exposing a torn file.
+
+    active.mp4 goes through .pending.mp4 and os.replace for the same reason every
+    other screen swap here does: MediaMTX may be reading it at any moment.
+    """
+    brb.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, brb)
+    pending = active.with_suffix(".pending.mp4")
+    shutil.copyfile(source, pending)
+    os.replace(pending, active)
+
+
+async def refresh_stream_slate(stream_id: int, slug: str) -> None:
+    """Re-seed a stream's slate after its feed changed shape."""
+    if has_uploaded_screen(stream_id, "brb"):
+        return
+    await ensure_slate_variants()
+    variant = snap_slate_variant(contribution_profile(stream_id))
+    source = slate_variant_path(variant)
+    if not source.exists():
+        return
+    brb = media_asset_path(slug, "brb")
+    # Variants differ in resolution and cadence, so they differ in size; a match
+    # means this stream is already on the right one.
+    if brb.exists() and brb.stat().st_size == source.stat().st_size:
+        return
+    await asyncio.to_thread(replace_seeded_slate, source, brb, active_media_path(slug))
+    log.info("re-seeded %s slate at %sx%sp%g", slug, *variant)
+
+
 async def ensure_bootstrap_media() -> None:
     """Guarantee a slate exists before MediaMTX is allowed to start."""
-    template = (DB_PATH.parent / "media" / "_default" / "brb.mp4")
-    if not template.exists() and ensure_default_media_template() is None:
-        await generate_placeholder_slate(template)
+    await ensure_slate_variants()
     with connect() as conn:
-        slugs = [row["slug"] for row in conn.execute("SELECT slug FROM streams")]
+        streams = conn.execute("SELECT id, slug FROM streams").fetchall()
     # mediamtx.yml declares a static path whose alwaysAvailableFile must resolve
     # at load time even before that user exists.
-    for slug in {*slugs, "studio"}:
+    for slug in {*(row["slug"] for row in streams), "studio"}:
         try:
             seed_stream_media(slug)
         except Exception as exc:
             log.warning("could not seed media for %s: %s", slug, exc)
-
-
-def ensure_default_media_template() -> Path | None:
-    media_root = DB_PATH.parent / "media"
-    template_dir = media_root / "_default"
-    template_dir.mkdir(parents=True, exist_ok=True)
-    template = template_dir / "brb.mp4"
-    if template.exists():
-        return template
-    if not DB_PATH.exists():
-        return None
-    with connect() as conn:
-        rows = conn.execute(
-            """SELECT s.slug FROM streams s JOIN users u ON u.id = s.user_id
-               ORDER BY CASE WHEN u.role = 'owner' THEN 0 ELSE 1 END, s.id"""
-        ).fetchall()
-    for row in rows:
-        candidate = media_root / row["slug"] / "brb.mp4"
-        if candidate.exists():
-            shutil.copyfile(candidate, template)
-            return template
-    return None
+    # Seeding only writes when nothing is there, so a stream seeded before this
+    # recipe existed still carries a slate of the wrong geometry and nothing else
+    # would notice until its feed happened to change shape. Correct those here so
+    # the repair applies itself on deploy rather than needing files deleted by
+    # hand. Uploaded screens are left alone.
+    for row in streams:
+        try:
+            await refresh_stream_slate(row["id"], row["slug"])
+        except Exception as exc:
+            log.warning("could not refresh slate for %s: %s", row["slug"], exc)
 
 
 def seed_stream_media(slug: str) -> bool:
-    template = ensure_default_media_template()
-    if template is None:
-        return False
+    """Give this stream a slate that matches its own feed geometry.
+
+    This deliberately never copies another tenant's screen. The previous
+    behaviour took the first uploaded BRB it could find and propagated it to
+    every stream, which put one operator's card on another operator's channel and
+    handed everybody whatever resolution that one file happened to be — in
+    practice a single 720p48 file standing in for 1080p feeds.
+    """
     brb = media_asset_path(slug, "brb")
     active = active_media_path(slug)
+    source = slate_variant_path(stream_slate_variant(slug))
+    if not source.exists():
+        # Bootstrap ordering: variants are rendered once the DB is readable, but
+        # MediaMTX opens alwaysAvailableFile at config load. Anything already on
+        # disk beats no file at all.
+        if not brb.exists():
+            return False
+        source = brb
+    brb.parent.mkdir(parents=True, exist_ok=True)
     if not brb.exists():
-        shutil.copyfile(template, brb)
+        shutil.copyfile(source, brb)
     if not active.exists():
         shutil.copyfile(brb, active)
     return True
@@ -2457,6 +2579,9 @@ class FailoverAdManager:
                 profile["gop_seconds"], profile["profile"], profile["level"],
                 profile["refs"], profile["bframes"],
             )
+            # The slate has to follow the feed: a stream that changed shape is
+            # otherwise still covered by a slate of the previous geometry.
+            await refresh_stream_slate(stream["id"], stream["slug"])
 
     async def _loop(self) -> None:
         while True:
