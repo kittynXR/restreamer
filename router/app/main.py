@@ -143,7 +143,14 @@ METRICS_OUTPUT_RATE_MIN_SPAN_S = 2.0
 # delivered no bytes for this long, drop it so the slate can take over instead of
 # waiting out MediaMTX's peer-idle timeout. Must stay comfortably above the
 # negotiated SRT latency (500 ms) plus retransmission bursts.
-FAST_FAILOVER_STALL_SECONDS = 2.0
+# How long a connected publisher may deliver no bytes before fast failover
+# drops it so the slate can take over. The floor is SRT's own recovery: with a
+# 500 ms tsbpd window, gaps up to ~1 s are routinely refilled by retransmission
+# and never reach a viewer, so kicking inside that band trades an invisible blip
+# for a forced OBS reconnect. Detection adds the metrics sampling interval on
+# top of this threshold, so the kick lands roughly 1.5-2.5 s after the feed dies.
+FAST_FAILOVER_STALL_SECONDS = 1.5
+FAST_FAILOVER_CHECK_SECONDS = 1.0
 
 WORKER_RETRY_MIN_SECONDS = 0.5
 WORKER_RETRY_MAX_SECONDS = 30.0
@@ -2399,6 +2406,7 @@ signal_metrics = SignalMetrics()
 class FailoverAdManager:
     def __init__(self) -> None:
         self.task: asyncio.Task | None = None
+        self.fast_task: asyncio.Task | None = None
         self.states: dict[int, dict[str, Any]] = {}
         self.kicks: dict[int, float] = {}
         self.probes: dict[int, float] = {}
@@ -2406,14 +2414,39 @@ class FailoverAdManager:
 
     async def start(self) -> None:
         self.task = asyncio.create_task(self._loop())
+        self.fast_task = asyncio.create_task(self._fast_loop())
 
     async def shutdown(self) -> None:
-        if self.task:
-            self.task.cancel()
+        for task in (self.task, self.fast_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _fast_loop(self) -> None:
+        """Stall enforcement on its own cadence.
+
+        The outage loop ticks every 3 seconds, which is fine for ad checks but
+        dominated how long a dead feed stayed on air before fast failover kicked
+        it: sampling, threshold and loop tick added up to 2-6 seconds of starved
+        players. Enforcement therefore runs once per metrics sample instead.
+        """
+        while True:
             try:
-                await self.task
+                with connect() as conn:
+                    streams = conn.execute(
+                        """SELECT s.* FROM streams s JOIN users u ON u.id = s.user_id
+                           WHERE u.enabled = 1 ORDER BY s.id"""
+                    ).fetchall()
+                for stream in streams:
+                    await self._enforce_fast_failover(stream)
             except asyncio.CancelledError:
+                raise
+            except Exception:
                 pass
+            await asyncio.sleep(FAST_FAILOVER_CHECK_SECONDS)
 
     def _record(
         self,
@@ -2548,6 +2581,12 @@ class FailoverAdManager:
         Opt-in per stream, because the threshold must stay above the negotiated
         SRT latency plus retransmission bursts or it will drop healthy feeds.
         """
+        # A tick where MediaMTX could not be reached is not a stall: a failed
+        # sample leaves the metrics snapshot stale rather than empty, so acting
+        # on it could kick a publisher that is fine. Hold, exactly as the outage
+        # state machine does.
+        if not signal_metrics.reachable:
+            return
         if not fast_failover_enabled(stream["id"]):
             return
         if current_program_mode(stream["id"]) != "live":
@@ -2615,7 +2654,6 @@ class FailoverAdManager:
                         # state is the only safe reading: treating it as an
                         # outage would fire an ad and re-copy the screen.
                         continue
-                    await self._enforce_fast_failover(stream)
                     online = bool(media["online"])
                     state = self.states.setdefault(
                         stream["id"],

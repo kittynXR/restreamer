@@ -1342,5 +1342,59 @@ class MediaStatusTest(unittest.TestCase):
         self.assertTrue(live["online"])
 
 
+class FastFailoverEnforcementTest(unittest.IsolatedAsyncioTestCase):
+    """The stall kick: fires only on evidence, never on absence of evidence."""
+
+    STREAM = {"id": 7, "slug": "studio"}
+
+    def manager(self) -> main.FailoverAdManager:
+        return main.FailoverAdManager()
+
+    async def enforce(self, *, reachable: bool, stalled: float | None,
+                      manager: main.FailoverAdManager | None = None) -> mock.AsyncMock:
+        kick = mock.AsyncMock()
+        with mock.patch.object(main.signal_metrics, "reachable", reachable), \
+                mock.patch.object(main.signal_metrics, "stalled_for", return_value=stalled), \
+                mock.patch.object(main, "fast_failover_enabled", return_value=True), \
+                mock.patch.object(main, "current_program_mode", return_value="live"), \
+                mock.patch.object(main, "kick_stream_publishers", kick):
+            await (manager or self.manager())._enforce_fast_failover(self.STREAM)
+        return kick
+
+    async def test_an_unreachable_media_server_is_not_a_stall(self) -> None:
+        """A failed sample leaves the metrics snapshot stale rather than empty,
+        so stalled_for keeps growing during a MediaMTX outage. Kicking on that
+        would drop a publisher that may be fine — hold, exactly as the outage
+        state machine does."""
+        kick = await self.enforce(reachable=False, stalled=999.0)
+        kick.assert_not_awaited()
+
+    async def test_a_gap_srt_can_still_recover_is_left_alone(self) -> None:
+        kick = await self.enforce(
+            reachable=True, stalled=main.FAST_FAILOVER_STALL_SECONDS - 0.1
+        )
+        kick.assert_not_awaited()
+
+    async def test_a_real_stall_is_kicked_once_not_hammered(self) -> None:
+        manager = self.manager()
+        first = await self.enforce(
+            reachable=True, stalled=main.FAST_FAILOVER_STALL_SECONDS + 0.5, manager=manager
+        )
+        first.assert_awaited_once_with("studio")
+        # The 1 s check loop will see the same stall again next tick; the
+        # dedupe window keeps that from turning into a kick storm.
+        second = await self.enforce(
+            reachable=True, stalled=main.FAST_FAILOVER_STALL_SECONDS + 1.5, manager=manager
+        )
+        second.assert_not_awaited()
+
+    def test_the_threshold_stays_above_srt_recovery(self) -> None:
+        """The tsbpd window is 500 ms: gaps up to ~1 s are refilled by
+        retransmission and never reach a viewer. A threshold at or below that
+        trades an invisible blip for a forced OBS reconnect."""
+        self.assertGreaterEqual(main.FAST_FAILOVER_STALL_SECONDS, 1.5)
+        self.assertLessEqual(main.FAST_FAILOVER_CHECK_SECONDS, main.METRICS_INTERVAL_SECONDS)
+
+
 if __name__ == "__main__":
     unittest.main()
