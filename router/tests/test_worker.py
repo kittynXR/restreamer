@@ -1396,5 +1396,46 @@ class FastFailoverEnforcementTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(main.FAST_FAILOVER_CHECK_SECONDS, main.METRICS_INTERVAL_SECONDS)
 
 
+class StallLedgerTest(unittest.TestCase):
+    """Recovered stalls are recorded when they happen, because the question
+    'how often does the link stall for 1-1.5 s?' cannot be answered after the
+    fact from anything else the system keeps."""
+
+    def record_at(self, metrics: main.SignalMetrics, moment: float, received: int) -> None:
+        metrics.paths = {"studio": {"inboundBytes": received}}
+        with mock.patch.object(main.time, "monotonic", return_value=moment):
+            metrics._record("studio")
+
+    def fresh_metrics(self) -> main.SignalMetrics:
+        metrics = main.SignalMetrics()
+        metrics.publishers = {"studio": {"id": "conn-1"}}
+        return metrics
+
+    def test_a_recovered_stall_is_logged_with_its_duration(self) -> None:
+        metrics = self.fresh_metrics()
+        self.record_at(metrics, 10.0, 100)
+        self.record_at(metrics, 11.0, 200)   # moving normally
+        self.record_at(metrics, 12.0, 200)   # stall begins
+        with self.assertLogs("relay", level="INFO") as captured:
+            self.record_at(metrics, 12.3, 300)
+        self.assertIn("stalled 1.3s then recovered", captured.output[0])
+
+    def test_a_sub_second_hiccup_is_not_written_up(self) -> None:
+        metrics = self.fresh_metrics()
+        self.record_at(metrics, 10.0, 100)
+        self.record_at(metrics, 10.9, 200)
+        with self.assertNoLogs("relay", level="INFO"):
+            self.record_at(metrics, 11.8, 300)
+
+    def test_a_sampling_outage_is_not_mistaken_for_a_stall(self) -> None:
+        """If MediaMTX could not be sampled for a while, bytes advance a lot on
+        the next successful read; that is our blindness, not their stall."""
+        metrics = self.fresh_metrics()
+        self.record_at(metrics, 10.0, 100)
+        self.record_at(metrics, 11.0, 200)
+        with self.assertNoLogs("relay", level="INFO"):
+            self.record_at(metrics, 16.0, 900)  # 5 s since the last sample
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2318,6 +2318,25 @@ class SignalMetrics:
         moment = time.monotonic()
         if isinstance(received, (int, float)):
             if entry["bytes"] is not None and received > entry["bytes"]:
+                stalled = moment - entry["moving_at"]
+                sampling_gap = (
+                    moment - entry["bytes_at"] if entry["bytes_at"] is not None else None
+                )
+                # The stall ledger: every gap a publisher rode out without fast
+                # failover acting, with its measured duration. Whether the kick
+                # threshold can safely drop below its current value is exactly
+                # the question of how often these lines appear just under it --
+                # unanswerable in retrospect unless recorded at the time. The
+                # sampling-gap guard keeps a MediaMTX outage from being written
+                # up as a publisher stall, and a reconnect starts a fresh entry,
+                # so real outages never land here.
+                if (
+                    conn is not None
+                    and stalled >= 1.0
+                    and sampling_gap is not None
+                    and sampling_gap <= METRICS_INTERVAL_SECONDS * 2
+                ):
+                    log.info("publisher on %s stalled %.1fs then recovered", slug, stalled)
                 entry["moving_at"] = moment
             entry["bytes"] = received
             entry["bytes_at"] = moment
