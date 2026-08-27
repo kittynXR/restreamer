@@ -152,6 +152,16 @@ METRICS_OUTPUT_RATE_MIN_SPAN_S = 2.0
 FAST_FAILOVER_STALL_SECONDS = 1.5
 FAST_FAILOVER_CHECK_SECONDS = 1.0
 
+# The stall ledger's probe. The 1 s metrics sampler cannot see gaps shorter
+# than its own tick -- on a healthy feed the byte counter advances every
+# sample, so its resolution floor is a whole tick -- so recovered stalls are
+# measured by a dedicated 4 Hz poll of the path byte counter, honest down to
+# the 0.5 s floor. Events persist so the week's counts survive redeploys.
+STALL_PROBE_INTERVAL_SECONDS = 0.25
+STALL_EVENT_MIN_SECONDS = 0.5
+STALL_EVENT_RETENTION_DAYS = 14
+STALL_REPORT_WINDOW_DAYS = 7
+
 WORKER_RETRY_MIN_SECONDS = 0.5
 WORKER_RETRY_MAX_SECONDS = 30.0
 WORKER_HEALTHY_SECONDS = 30.0
@@ -274,6 +284,14 @@ def initialize_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_failover_ad_events_stream_id
                 ON failover_ad_events(stream_id, id DESC);
+            CREATE TABLE IF NOT EXISTS stall_events (
+                id INTEGER PRIMARY KEY,
+                stream_id INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
+                duration_s REAL NOT NULL,
+                recorded_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stall_events_stream_time
+                ON stall_events(stream_id, recorded_at);
             CREATE TABLE IF NOT EXISTS media_assets (
                 stream_id INTEGER NOT NULL REFERENCES streams(id) ON DELETE CASCADE,
                 kind TEXT NOT NULL CHECK(kind IN ('brb', 'starting_soon')),
@@ -2318,25 +2336,6 @@ class SignalMetrics:
         moment = time.monotonic()
         if isinstance(received, (int, float)):
             if entry["bytes"] is not None and received > entry["bytes"]:
-                stalled = moment - entry["moving_at"]
-                sampling_gap = (
-                    moment - entry["bytes_at"] if entry["bytes_at"] is not None else None
-                )
-                # The stall ledger: every gap a publisher rode out without fast
-                # failover acting, with its measured duration. Whether the kick
-                # threshold can safely drop below its current value is exactly
-                # the question of how often these lines appear just under it --
-                # unanswerable in retrospect unless recorded at the time. The
-                # sampling-gap guard keeps a MediaMTX outage from being written
-                # up as a publisher stall, and a reconnect starts a fresh entry,
-                # so real outages never land here.
-                if (
-                    conn is not None
-                    and stalled >= 1.0
-                    and sampling_gap is not None
-                    and sampling_gap <= METRICS_INTERVAL_SECONDS * 2
-                ):
-                    log.info("publisher on %s stalled %.1fs then recovered", slug, stalled)
                 entry["moving_at"] = moment
             entry["bytes"] = received
             entry["bytes_at"] = moment
@@ -2420,6 +2419,149 @@ class SignalMetrics:
 
 
 signal_metrics = SignalMetrics()
+
+
+class StallProbe:
+    """Measures the delivery gaps a publisher rides out, at sub-second resolution.
+
+    Whether the fast failover threshold can safely drop is exactly the question
+    of how often the link stalls just under it, and that cannot be answered in
+    retrospect: sub-threshold stalls never reach any log, and per-connection
+    SRT counters die with the connection. The 1 s metrics sampler cannot help
+    either -- on a healthy feed its byte counter advances every tick, so its
+    resolution floor is a whole tick. This probe polls the path byte counter at
+    4 Hz for exactly the streams that currently have a live publisher and
+    records every recovered gap of STALL_EVENT_MIN_SECONDS or more, so the
+    dashboard can report the week's counts.
+    """
+
+    def __init__(self) -> None:
+        self.task: asyncio.Task | None = None
+        self.watch: dict[str, dict[str, Any]] = {}
+
+    async def start(self) -> None:
+        self.task = asyncio.create_task(self._loop())
+
+    async def shutdown(self) -> None:
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+
+    def observe(
+        self, slug: str, connection_id: Any, received: Any, moment: float
+    ) -> float | None:
+        """One poll's worth of evidence; returns a stall duration to record.
+
+        A reconnect starts a fresh entry, so a real drop never reads as a
+        recovered stall, and a hole in our own polling suppresses the event --
+        our blindness is not their stall.
+        """
+        entry = self.watch.get(slug)
+        if entry is None or entry["connection_id"] != connection_id:
+            entry = {
+                "connection_id": connection_id,
+                "bytes": None,
+                "advanced_at": moment,
+                "polled_at": moment,
+            }
+            self.watch[slug] = entry
+        if not isinstance(received, (int, float)):
+            return None
+        event: float | None = None
+        if entry["bytes"] is not None and received > entry["bytes"]:
+            gap = moment - entry["advanced_at"]
+            probe_hole = moment - entry["polled_at"]
+            if (
+                gap >= STALL_EVENT_MIN_SECONDS
+                and probe_hole <= STALL_PROBE_INTERVAL_SECONDS * 2 + 0.1
+            ):
+                event = gap
+            entry["advanced_at"] = moment
+        elif entry["bytes"] is None:
+            entry["advanced_at"] = moment
+        entry["bytes"] = received
+        entry["polled_at"] = moment
+        return event
+
+    def _record_event(self, slug: str, duration: float) -> None:
+        log.info("publisher on %s stalled %.2fs then recovered", slug, duration)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=STALL_EVENT_RETENTION_DAYS)
+        ).isoformat()
+        with connect() as conn:
+            row = conn.execute("SELECT id FROM streams WHERE slug = ?", (slug,)).fetchone()
+            if row is None:
+                return
+            conn.execute(
+                "INSERT INTO stall_events(stream_id, duration_s, recorded_at) VALUES(?, ?, ?)",
+                (row["id"], round(duration, 2), now()),
+            )
+            conn.execute("DELETE FROM stall_events WHERE recorded_at < ?", (cutoff,))
+
+    async def _sample(self, client: httpx.AsyncClient) -> None:
+        # signal_metrics owns publisher discovery; a slug is watched only while
+        # it has a live SRT publisher, so slate playback never counts as data.
+        publishers = dict(signal_metrics.publishers)
+        for stale in set(self.watch) - set(publishers):
+            self.watch.pop(stale, None)
+        for slug, conn_info in publishers.items():
+            try:
+                response = await client.get(
+                    f"{MEDIAMTX_API}/v3/paths/get/{quote(slug, safe='')}"
+                )
+                response.raise_for_status()
+                path = response.json()
+            except Exception:
+                continue
+            received = path.get("inboundBytes")
+            if received is None:
+                received = path.get("bytesReceived")
+            event = self.observe(slug, conn_info.get("id"), received, time.monotonic())
+            if event is not None:
+                await asyncio.to_thread(self._record_event, slug, event)
+
+    async def _loop(self) -> None:
+        async with httpx.AsyncClient(timeout=2) as client:
+            while True:
+                try:
+                    await self._sample(client)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                await asyncio.sleep(STALL_PROBE_INTERVAL_SECONDS)
+
+
+stall_probe = StallProbe()
+
+
+def stall_report(stream_id: int) -> dict[str, Any]:
+    """The week's recovered stalls, for the dashboard.
+
+    Counts come from the persisted ledger rather than anything in memory, so
+    they survive router redeploys and cover whole streams, not the last few
+    minutes.
+    """
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=STALL_REPORT_WINDOW_DAYS)
+    ).isoformat()
+    with connect() as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN duration_s >= 1.0 THEN 1 ELSE 0 END) AS over_1s,
+                      MAX(duration_s) AS longest
+               FROM stall_events WHERE stream_id = ? AND recorded_at >= ?""",
+            (stream_id, cutoff),
+        ).fetchone()
+    return {
+        "window_days": STALL_REPORT_WINDOW_DAYS,
+        "over_half_s": row["total"] or 0,
+        "over_1s": row["over_1s"] or 0,
+        "longest_s": round(row["longest"], 2) if row["longest"] is not None else None,
+    }
 
 
 class FailoverAdManager:
@@ -2750,11 +2892,13 @@ async def lifespan(_: FastAPI):
     twitch_ingests.load_saved()
     await path_reconciler.start()
     await signal_metrics.start()
+    await stall_probe.start()
     await workers.start_enabled()
     await failover_ads.start()
     await twitch_ingests.start(probe_now=False)
     yield
     await failover_ads.shutdown()
+    await stall_probe.shutdown()
     await signal_metrics.shutdown()
     await path_reconciler.shutdown()
     await media_conversions.shutdown()
@@ -3331,6 +3475,7 @@ async def state(request: Request) -> dict[str, Any]:
             "signal": signal_metrics.snapshot(stream["slug"]),
             "fast_failover": fast_failover_enabled(stream["id"]),
             "fast_failover_seconds": FAST_FAILOVER_STALL_SECONDS,
+            "stalls": stall_report(stream["id"]),
         },
         "twitch_ingest": twitch_ingests.selection,
         "twitch": twitch_state(user["id"], stream["id"]),

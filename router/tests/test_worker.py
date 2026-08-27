@@ -1396,45 +1396,51 @@ class FastFailoverEnforcementTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(main.FAST_FAILOVER_CHECK_SECONDS, main.METRICS_INTERVAL_SECONDS)
 
 
-class StallLedgerTest(unittest.TestCase):
-    """Recovered stalls are recorded when they happen, because the question
-    'how often does the link stall for 1-1.5 s?' cannot be answered after the
-    fact from anything else the system keeps."""
+class StallProbeTest(unittest.TestCase):
+    """The stall ledger's probe: sub-second resolution, no false entries.
 
-    def record_at(self, metrics: main.SignalMetrics, moment: float, received: int) -> None:
-        metrics.paths = {"studio": {"inboundBytes": received}}
-        with mock.patch.object(main.time, "monotonic", return_value=moment):
-            metrics._record("studio")
+    The 1 s metrics sampler cannot see gaps shorter than its own tick — on a
+    healthy feed its byte counter advances every sample — which is why the
+    probe exists at all, and why these tests drive `observe` on a 0.25 s
+    cadence."""
 
-    def fresh_metrics(self) -> main.SignalMetrics:
-        metrics = main.SignalMetrics()
-        metrics.publishers = {"studio": {"id": "conn-1"}}
-        return metrics
+    def test_a_healthy_feed_never_produces_an_event(self) -> None:
+        probe = main.StallProbe()
+        for tick in range(20):
+            event = probe.observe("studio", "conn-1", 1000 * (tick + 1), 10.0 + tick * 0.25)
+            self.assertIsNone(event)
 
-    def test_a_recovered_stall_is_logged_with_its_duration(self) -> None:
-        metrics = self.fresh_metrics()
-        self.record_at(metrics, 10.0, 100)
-        self.record_at(metrics, 11.0, 200)   # moving normally
-        self.record_at(metrics, 12.0, 200)   # stall begins
-        with self.assertLogs("relay", level="INFO") as captured:
-            self.record_at(metrics, 12.3, 300)
-        self.assertIn("stalled 1.3s then recovered", captured.output[0])
+    def test_a_recovered_stall_is_measured_at_probe_resolution(self) -> None:
+        probe = main.StallProbe()
+        probe.observe("studio", "conn-1", 1000, 10.0)
+        probe.observe("studio", "conn-1", 2000, 10.25)   # moving
+        probe.observe("studio", "conn-1", 2000, 10.5)    # stall begins
+        probe.observe("studio", "conn-1", 2000, 10.75)
+        event = probe.observe("studio", "conn-1", 3000, 11.0)
+        self.assertAlmostEqual(event, 0.75)
 
-    def test_a_sub_second_hiccup_is_not_written_up(self) -> None:
-        metrics = self.fresh_metrics()
-        self.record_at(metrics, 10.0, 100)
-        self.record_at(metrics, 10.9, 200)
-        with self.assertNoLogs("relay", level="INFO"):
-            self.record_at(metrics, 11.8, 300)
+    def test_a_gap_under_the_floor_is_not_an_event(self) -> None:
+        probe = main.StallProbe()
+        probe.observe("studio", "conn-1", 1000, 10.0)
+        probe.observe("studio", "conn-1", 2000, 10.25)
+        probe.observe("studio", "conn-1", 2000, 10.5)
+        self.assertIsNone(probe.observe("studio", "conn-1", 3000, 10.65))  # 0.4 s
 
-    def test_a_sampling_outage_is_not_mistaken_for_a_stall(self) -> None:
-        """If MediaMTX could not be sampled for a while, bytes advance a lot on
-        the next successful read; that is our blindness, not their stall."""
-        metrics = self.fresh_metrics()
-        self.record_at(metrics, 10.0, 100)
-        self.record_at(metrics, 11.0, 200)
-        with self.assertNoLogs("relay", level="INFO"):
-            self.record_at(metrics, 16.0, 900)  # 5 s since the last sample
+    def test_a_hole_in_our_own_polling_is_not_their_stall(self) -> None:
+        """MediaMTX unreachable for a second reads as bytes jumping after a
+        gap; without this guard every API blip would be ledgered as a stall."""
+        probe = main.StallProbe()
+        probe.observe("studio", "conn-1", 1000, 10.0)
+        probe.observe("studio", "conn-1", 2000, 10.25)
+        self.assertIsNone(probe.observe("studio", "conn-1", 9000, 11.5))
+
+    def test_a_reconnect_is_a_drop_not_a_recovered_stall(self) -> None:
+        probe = main.StallProbe()
+        probe.observe("studio", "conn-1", 1000, 10.0)
+        probe.observe("studio", "conn-1", 2000, 10.25)
+        # The publisher dropped and redialled; bytes and clock both moved on,
+        # but a fresh connection starts a fresh ledger entry.
+        self.assertIsNone(probe.observe("studio", "conn-2", 500, 14.0))
 
 
 if __name__ == "__main__":

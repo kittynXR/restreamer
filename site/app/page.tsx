@@ -61,6 +61,7 @@ type StreamState = {
     signal: SignalMetrics;
     fast_failover: boolean;
     fast_failover_seconds: number;
+    stalls?: { window_days: number; over_half_s: number; over_1s: number; longest_s?: number | null };
   };
   twitch_ingest: { name: string; latency_ms?: number | null; checked_at?: string | null };
   twitch: TwitchState;
@@ -808,6 +809,17 @@ export default function Home() {
               <button className={`toggle ${state.stream.fast_failover ? "on" : ""}`} type="button" role="switch" aria-checked={state.stream.fast_failover} aria-label={state.stream.fast_failover ? "Turn off fast handoff" : "Turn on fast handoff"} disabled={protectionBusy} onClick={() => setFastFailover(!state.stream.fast_failover)}><span /></button>
             </div>
             <div className={`protection-state ${protectionArmed ? "" : "unavailable"}`}><span /> {protectionArmed ? "Armed" : "Backup screen unavailable"}</div>
+            {state.stream.stalls && (
+              /* The stall ledger: recovered delivery gaps too short for fast
+                 handoff to act on. How often these land between 0.5s and the
+                 handoff threshold is the evidence for whether the threshold
+                 can safely drop. */
+              <p className="stall-ledger">
+                {state.stream.stalls.over_half_s === 0
+                  ? `No stalls over 0.5s in the past ${state.stream.stalls.window_days} days`
+                  : `Rode out ${state.stream.stalls.over_half_s} stall${state.stream.stalls.over_half_s === 1 ? "" : "s"} over 0.5s (${state.stream.stalls.over_1s} over 1s${state.stream.stalls.longest_s != null ? `, longest ${state.stream.stalls.longest_s}s` : ""}) in the past ${state.stream.stalls.window_days} days`}
+              </p>
+            )}
           </article>
         </section>
 
