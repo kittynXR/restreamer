@@ -1038,7 +1038,13 @@ def snap_slate_variant(profile: dict[str, Any]) -> tuple[int, int, float]:
 
 def slate_variant_path(variant: tuple[int, int, float]) -> Path:
     width, height, fps = variant
-    return DB_PATH.parent / "media" / "_default" / f"slate-{width}x{height}p{fps:g}.mp4"
+    # The recipe version is part of the filename: ensure_slate_variants only
+    # renders what is missing, so without it a SLATE_ENCODER_VERSION bump would
+    # keep serving files rendered by the old recipe forever.
+    return (
+        DB_PATH.parent / "media" / "_default"
+        / f"slate-{width}x{height}p{fps:g}v{SLATE_ENCODER_VERSION}.mp4"
+    )
 
 
 def stream_slate_variant(slug: str) -> tuple[int, int, float]:
@@ -1164,6 +1170,11 @@ async def refresh_stream_slate(stream_id: int, slug: str) -> None:
         return
     await asyncio.to_thread(replace_seeded_slate, source, brb, active_media_path(slug))
     log.info("re-seeded %s slate at %sx%sp%g", slug, *variant)
+    # MediaMTX fixed the path's parameter sets from the previous file when the
+    # path was created, so the new slate reaches the wire only once the path is
+    # recreated. Attempting it here is safe: reload declines unless the path is
+    # genuinely idle, and a router-only deploy has no other recreation point.
+    await reload_fallback_path(slug)
 
 
 async def ensure_bootstrap_media() -> None:
@@ -1858,7 +1869,7 @@ class WorkerManager:
     def _reset_metrics(self, destination_id: int) -> None:
         self.metrics[destination_id] = {
             "series": deque(maxlen=METRICS_OUTPUT_SAMPLES),
-            # (monotonic, total_bytes) pairs behind the derived rate. Cleared
+            # (out_time_s, total_bytes) pairs behind the derived rate. Cleared
             # with everything else so a restarted worker never differences its
             # fresh byte counter against the dead process's last reading.
             "rate_history": deque(maxlen=METRICS_OUTPUT_SAMPLES),

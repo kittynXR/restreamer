@@ -314,9 +314,14 @@ function ContributionPanel({ signal, media, programMode }: { signal: SignalMetri
         <div className="spark-cell"><span>Round trip</span><Spark points={rtt} tone="amber" /></div>
       </div>
       <dl className="metric-list">
+        {/* Counter semantics (gosrt, verified at source): packets_lost counts
+            sequences detected missing, almost all of which the retransmissions
+            above recover; packets_belated is the part that arrived too late to
+            use. packets_dropped is duplicate copies being discarded — SRT
+            working, not failing — which is why it is not shown here as loss. */}
         <div><dt>Retransmitted</dt><dd>{formatNumber(signal.packets_retransmitted)} pkts</dd></div>
-        <div><dt>Dropped</dt><dd>{formatNumber(signal.packets_dropped)} pkts</dd></div>
-        <div><dt>Arrived late</dt><dd>{formatNumber(signal.packets_belated)} pkts</dd></div>
+        <div><dt>Went missing</dt><dd>{formatNumber(signal.packets_lost)} pkts</dd></div>
+        <div><dt>Too late to use</dt><dd>{formatNumber(signal.packets_belated)} pkts</dd></div>
         <div><dt>Corrupt frames</dt><dd>{formatNumber(signal.frames_in_error)}</dd></div>
         <div><dt>Received</dt><dd>{formatBytes(signal.bytes_received)}</dd></div>
         <div><dt>Forwarders reading</dt><dd>{formatNumber(signal.reader_count)}</dd></div>

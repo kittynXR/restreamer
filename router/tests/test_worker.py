@@ -618,8 +618,19 @@ class SlateVariantTest(unittest.TestCase):
         paths = {main.slate_variant_path(v) for v in main.SLATE_VARIANTS}
         self.assertEqual(len(paths), len(main.SLATE_VARIANTS), "variants must not share a file")
         self.assertEqual(
-            main.slate_variant_path((1920, 1080, 48.0)).name, "slate-1920x1080p48.mp4"
+            main.slate_variant_path((1920, 1080, 48.0)).name,
+            f"slate-1920x1080p48v{main.SLATE_ENCODER_VERSION}.mp4",
         )
+
+    def test_a_recipe_bump_renames_the_cached_variants(self) -> None:
+        """ensure_slate_variants only renders missing files, so the encoder
+        version has to live in the filename or a recipe change keeps serving
+        files rendered by the old recipe forever."""
+        variant = (1920, 1080, 48.0)
+        current = main.slate_variant_path(variant)
+        with mock.patch.object(main, "SLATE_ENCODER_VERSION", main.SLATE_ENCODER_VERSION + 1):
+            bumped = main.slate_variant_path(variant)
+        self.assertNotEqual(current, bumped)
 
     def test_the_slate_recipe_never_emits_b_frames(self) -> None:
         """The file in production carried has_b_frames=2. B-frames make PTS != DTS,
