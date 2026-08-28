@@ -295,7 +295,10 @@ button:disabled,.button-link[aria-disabled="true"] { cursor:not-allowed; opacity
 .fast-failover .toggle { flex:none; }
 .fast-failover + .fast-failover { margin-top:10px; }
 .fast-failover strong { display:block; font-size:12px; }
-.fast-failover span { display:block; margin-top:3px; color:var(--muted); font-size:10px; line-height:1.4; }
+/* Scoped to the text column: a bare `.fast-failover span` also matches the
+   toggle's knob span and outranks `.toggle span` by stylesheet order, pushing
+   the knob 3px off-center. */
+.fast-failover div span { display:block; margin-top:3px; color:var(--muted); font-size:10px; line-height:1.4; }
 .protection-state.unavailable { color:#f0bd62; }
 .protection-state.unavailable span { background:#e6a83a; box-shadow:0 0 0 4px rgba(230,168,58,.11); }
 .stale-notice { border:1px solid #4a3515; background:#1b1205; color:#f0bd62; }
