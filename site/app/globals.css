@@ -290,6 +290,10 @@ button:disabled,.button-link[aria-disabled="true"] { cursor:not-allowed; opacity
 .destination-actions { display:flex; align-items:center; gap:12px; }
 .destination-error { grid-column:2 / -1; margin:0 0 12px; max-height:3.9em; overflow:auto; overflow-wrap:anywhere; color:#ff9fa6; font-size:11px; line-height:1.45; }
 .fast-failover { width:100%; margin-top:20px; padding:11px 12px; display:flex; align-items:center; justify-content:space-between; gap:12px; border:1px solid #222b27; border-radius:11px; background:#030504; }
+/* The pill is fixed-size; without this the row with the longer description
+   compresses its toggle and the two knobs stop lining up. */
+.fast-failover .toggle { flex:none; }
+.fast-failover + .fast-failover { margin-top:10px; }
 .fast-failover strong { display:block; font-size:12px; }
 .fast-failover span { display:block; margin-top:3px; color:var(--muted); font-size:10px; line-height:1.4; }
 .protection-state.unavailable { color:#f0bd62; }

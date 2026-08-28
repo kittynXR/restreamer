@@ -3713,6 +3713,10 @@ async def set_stream_fast_failover(body: FastFailoverBody, request: Request) -> 
     require_csrf(request)
     stream = stream_for_user(user["id"])
     set_fast_failover(stream["id"], body.enabled)
+    # The two speeds are one choice: enabling either supersedes the other, and
+    # the exclusivity lives here so every caller gets it, not just the toggle.
+    if body.enabled:
+        set_ultra_failover(stream["id"], False)
     return {"status": "enabled" if body.enabled else "disabled"}
 
 
@@ -3722,6 +3726,8 @@ async def set_stream_ultra_failover(body: FastFailoverBody, request: Request) ->
     require_csrf(request)
     stream = stream_for_user(user["id"])
     set_ultra_failover(stream["id"], body.enabled)
+    if body.enabled:
+        set_fast_failover(stream["id"], False)
     return {"status": "enabled" if body.enabled else "disabled"}
 
 

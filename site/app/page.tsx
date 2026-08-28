@@ -824,11 +824,11 @@ export default function Home() {
             <h2>Ready if your internet drops</h2>
             <p>Your backup screen keeps active destinations online while OBS reconnects.</p>
             <div className="fast-failover">
-              <div><strong>Fast handoff</strong><span>{state.stream.fast_failover ? `Switches after ${state.stream.fast_failover_seconds}s of silence` : "Waits for the media server to time out"}</span></div>
+              <div><strong>Fast handoff</strong><span>{state.stream.fast_failover ? `Switches after ${state.stream.fast_failover_seconds}s of silence` : state.stream.ultra_failover ? "Ultra-fast handoff is covering instead" : "Waits for the media server to time out"}</span></div>
               <button className={`toggle ${state.stream.fast_failover ? "on" : ""}`} type="button" role="switch" aria-checked={state.stream.fast_failover} aria-label={state.stream.fast_failover ? "Turn off fast handoff" : "Turn on fast handoff"} disabled={protectionBusy} onClick={() => setFastFailover(!state.stream.fast_failover)}><span /></button>
             </div>
             <div className="fast-failover">
-              <div><strong>Ultra-fast handoff</strong><span>{state.stream.ultra_failover ? `Switches after ${state.stream.ultra_failover_seconds}s of silence` : `Backup takes over after only ${state.stream.ultra_failover_seconds}s`}</span></div>
+              <div><strong>Ultra-fast handoff</strong><span>{state.stream.ultra_failover ? `Switches after ${state.stream.ultra_failover_seconds}s of silence` : state.stream.fast_failover ? "Fast handoff is covering instead" : `Switches after only ${state.stream.ultra_failover_seconds}s of silence`}</span></div>
               <button className={`toggle ${state.stream.ultra_failover ? "on" : ""}`} type="button" role="switch" aria-checked={state.stream.ultra_failover} aria-label={state.stream.ultra_failover ? "Turn off ultra-fast handoff" : "Turn on ultra-fast handoff"} disabled={protectionBusy} onClick={() => setUltraFailover(!state.stream.ultra_failover)}><span /></button>
             </div>
             <div className={`protection-state ${protectionArmed ? "" : "unavailable"}`}><span /> {protectionArmed ? "Armed" : "Backup screen unavailable"}</div>
