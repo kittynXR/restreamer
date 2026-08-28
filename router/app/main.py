@@ -162,6 +162,14 @@ STALL_EVENT_MIN_SECONDS = 0.5
 STALL_EVENT_RETENTION_DAYS = 14
 STALL_REPORT_WINDOW_DAYS = 7
 
+# Ultra-fast handoff: opt-in per stream, enforced from the 4 Hz probe because
+# the 1 s sampler cannot resolve half a second. The measured band is
+# post-buffer -- SRT's 500 ms tsbpd window keeps delivery moving through
+# shorter network gaps, so 0.5 s of delivery silence means the network has
+# already been dead for roughly a full second. The stall ledger is the
+# evidence basis: enable this only on a link whose ledger stays empty.
+ULTRA_FAILOVER_STALL_SECONDS = 0.5
+
 WORKER_RETRY_MIN_SECONDS = 0.5
 WORKER_RETRY_MAX_SECONDS = 30.0
 WORKER_HEALTHY_SECONDS = 30.0
@@ -777,6 +785,28 @@ def set_program_mode(stream_id: int, mode: str) -> None:
 
 def fast_failover_key(stream_id: int) -> str:
     return f"fast_failover:{stream_id}"
+
+
+def ultra_failover_key(stream_id: int) -> str:
+    return f"ultra_failover:{stream_id}"
+
+
+def ultra_failover_enabled(stream_id: int) -> bool:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = ?",
+            (ultra_failover_key(stream_id),),
+        ).fetchone()
+    return bool(row and row["value"] == "1")
+
+
+def set_ultra_failover(stream_id: int, enabled: bool) -> None:
+    with connect() as conn:
+        conn.execute(
+            """INSERT INTO app_settings(key, value, updated_at) VALUES(?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+            (ultra_failover_key(stream_id), "1" if enabled else "0", now()),
+        )
 
 
 def fast_failover_enabled(stream_id: int) -> bool:
@@ -2438,6 +2468,7 @@ class StallProbe:
     def __init__(self) -> None:
         self.task: asyncio.Task | None = None
         self.watch: dict[str, dict[str, Any]] = {}
+        self.kicks: dict[str, float] = {}
 
     async def start(self) -> None:
         self.task = asyncio.create_task(self._loop())
@@ -2501,6 +2532,42 @@ class StallProbe:
             )
             conn.execute("DELETE FROM stall_events WHERE recorded_at < ?", (cutoff,))
 
+    def stall_in_progress(self, slug: str, moment: float) -> float | None:
+        """How long this publisher's delivery has been silent, if trustworthy.
+
+        Only meaningful straight after a poll: a hole in our own polling makes
+        the age of the last advance unknowable, so it reports None rather than
+        a number that would kick a healthy publisher.
+        """
+        entry = self.watch.get(slug)
+        if entry is None or entry["bytes"] is None:
+            return None
+        if moment - entry["polled_at"] > STALL_PROBE_INTERVAL_SECONDS * 2 + 0.1:
+            return None
+        return moment - entry["advanced_at"]
+
+    async def _enforce_ultra(self, slug: str, stalled: float) -> None:
+        """The 0.5 s kick, from the only loop fast enough to see it.
+
+        The regular fast-failover check reads the 1 s sampler and stays as the
+        1.5 s backstop; this fires first only on streams that opted in. The
+        cheap dedupe check runs before any database read because this is on
+        the 4 Hz path.
+        """
+        if time.monotonic() - self.kicks.get(slug, 0.0) < 10:
+            return
+        with connect() as conn:
+            row = conn.execute("SELECT id FROM streams WHERE slug = ?", (slug,)).fetchone()
+        if row is None or not ultra_failover_enabled(row["id"]):
+            return
+        if current_program_mode(row["id"]) != "live":
+            return
+        self.kicks[slug] = time.monotonic()
+        log.info(
+            "ultra failover: dropping stalled publisher on %s after %.2fs", slug, stalled
+        )
+        await kick_stream_publishers(slug)
+
     async def _sample(self, client: httpx.AsyncClient) -> None:
         # signal_metrics owns publisher discovery; a slug is watched only while
         # it has a live SRT publisher, so slate playback never counts as data.
@@ -2519,9 +2586,13 @@ class StallProbe:
             received = path.get("inboundBytes")
             if received is None:
                 received = path.get("bytesReceived")
-            event = self.observe(slug, conn_info.get("id"), received, time.monotonic())
+            moment = time.monotonic()
+            event = self.observe(slug, conn_info.get("id"), received, moment)
             if event is not None:
                 await asyncio.to_thread(self._record_event, slug, event)
+            stalled = self.stall_in_progress(slug, moment)
+            if stalled is not None and stalled >= ULTRA_FAILOVER_STALL_SECONDS:
+                await self._enforce_ultra(slug, stalled)
 
     async def _loop(self) -> None:
         async with httpx.AsyncClient(timeout=2) as client:
@@ -3475,6 +3546,8 @@ async def state(request: Request) -> dict[str, Any]:
             "signal": signal_metrics.snapshot(stream["slug"]),
             "fast_failover": fast_failover_enabled(stream["id"]),
             "fast_failover_seconds": FAST_FAILOVER_STALL_SECONDS,
+            "ultra_failover": ultra_failover_enabled(stream["id"]),
+            "ultra_failover_seconds": ULTRA_FAILOVER_STALL_SECONDS,
             "stalls": stall_report(stream["id"]),
         },
         "twitch_ingest": twitch_ingests.selection,
@@ -3640,6 +3713,15 @@ async def set_stream_fast_failover(body: FastFailoverBody, request: Request) -> 
     require_csrf(request)
     stream = stream_for_user(user["id"])
     set_fast_failover(stream["id"], body.enabled)
+    return {"status": "enabled" if body.enabled else "disabled"}
+
+
+@app.patch("/api/stream/ultra-failover")
+async def set_stream_ultra_failover(body: FastFailoverBody, request: Request) -> dict[str, str]:
+    user = require_user(request)
+    require_csrf(request)
+    stream = stream_for_user(user["id"])
+    set_ultra_failover(stream["id"], body.enabled)
     return {"status": "enabled" if body.enabled else "disabled"}
 
 

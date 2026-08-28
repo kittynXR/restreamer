@@ -61,6 +61,8 @@ type StreamState = {
     signal: SignalMetrics;
     fast_failover: boolean;
     fast_failover_seconds: number;
+    ultra_failover: boolean;
+    ultra_failover_seconds: number;
     stalls?: { window_days: number; over_half_s: number; over_1s: number; longest_s?: number | null };
   };
   twitch_ingest: { name: string; latency_ms?: number | null; checked_at?: string | null };
@@ -297,7 +299,7 @@ function Metric({ label, value, hint }: { label: string; value: string; hint?: s
 
 /** OBS → Relay: the contribution feed's own health, straight from MediaMTX's
  *  SRT connection counters. */
-function ContributionPanel({ signal, media, programMode }: { signal: SignalMetrics; media: StreamState["stream"]["media"]; programMode: string }) {
+function ContributionPanel({ signal, media, programMode, stalls }: { signal: SignalMetrics; media: StreamState["stream"]["media"]; programMode: string; stalls?: StreamState["stream"]["stalls"] }) {
   const health = signalHealth(signal, media.online);
   const bitrate = signal.series.bitrate_kbps;
   const rtt = signal.series.rtt_ms;
@@ -326,6 +328,10 @@ function ContributionPanel({ signal, media, programMode }: { signal: SignalMetri
         <div><dt>Corrupt frames</dt><dd>{formatNumber(signal.frames_in_error)}</dd></div>
         <div><dt>Received</dt><dd>{formatBytes(signal.bytes_received)}</dd></div>
         <div><dt>Forwarders reading</dt><dd>{formatNumber(signal.reader_count)}</dd></div>
+        {/* From the persisted stall ledger, not this connection: delivery gaps
+            in this feed after SRT recovery, counted across the whole week. */}
+        {stalls && <div><dt>Gaps over 0.5s · {stalls.window_days}d</dt><dd>{formatNumber(stalls.over_half_s)}</dd></div>}
+        {stalls && <div><dt>Gaps over 1s · {stalls.window_days}d</dt><dd>{formatNumber(stalls.over_1s)}</dd></div>}
       </dl>
       <p className="metric-caption">
         {signal.track_summary.length ? signal.track_summary.join(" · ")
@@ -731,6 +737,19 @@ export default function Home() {
     finally { setProtectionBusy(false); }
   }
 
+  async function setUltraFailover(enabled: boolean) {
+    setError("");
+    setProtectionBusy(true);
+    try {
+      await json("/api/stream/ultra-failover", {
+        method: "PATCH", headers: { "Content-Type": "application/json", "X-CSRF-Token": state!.csrf },
+        body: JSON.stringify({ enabled }),
+      });
+      await refreshState();
+    } catch (err) { setError(err instanceof Error ? err.message : "Could not change failover speed"); }
+    finally { setProtectionBusy(false); }
+  }
+
   async function logout() {
     await json("/api/logout", { method: "POST", headers: { "X-CSRF-Token": state!.csrf } });
     setSession({ setup_required: false, authenticated: false }); setState(null);
@@ -808,6 +827,10 @@ export default function Home() {
               <div><strong>Fast handoff</strong><span>{state.stream.fast_failover ? `Switches after ${state.stream.fast_failover_seconds}s of silence` : "Waits for the media server to time out"}</span></div>
               <button className={`toggle ${state.stream.fast_failover ? "on" : ""}`} type="button" role="switch" aria-checked={state.stream.fast_failover} aria-label={state.stream.fast_failover ? "Turn off fast handoff" : "Turn on fast handoff"} disabled={protectionBusy} onClick={() => setFastFailover(!state.stream.fast_failover)}><span /></button>
             </div>
+            <div className="fast-failover">
+              <div><strong>Ultra-fast handoff</strong><span>{state.stream.ultra_failover ? `Switches after ${state.stream.ultra_failover_seconds}s of silence` : `Backup takes over after only ${state.stream.ultra_failover_seconds}s`}</span></div>
+              <button className={`toggle ${state.stream.ultra_failover ? "on" : ""}`} type="button" role="switch" aria-checked={state.stream.ultra_failover} aria-label={state.stream.ultra_failover ? "Turn off ultra-fast handoff" : "Turn on ultra-fast handoff"} disabled={protectionBusy} onClick={() => setUltraFailover(!state.stream.ultra_failover)}><span /></button>
+            </div>
             <div className={`protection-state ${protectionArmed ? "" : "unavailable"}`}><span /> {protectionArmed ? "Armed" : "Backup screen unavailable"}</div>
             {state.stream.stalls && (
               /* The stall ledger: recovered delivery gaps too short for fast
@@ -816,8 +839,8 @@ export default function Home() {
                  can safely drop. */
               <p className="stall-ledger">
                 {state.stream.stalls.over_half_s === 0
-                  ? `No stalls over 0.5s in the past ${state.stream.stalls.window_days} days`
-                  : `Rode out ${state.stream.stalls.over_half_s} stall${state.stream.stalls.over_half_s === 1 ? "" : "s"} over 0.5s (${state.stream.stalls.over_1s} over 1s${state.stream.stalls.longest_s != null ? `, longest ${state.stream.stalls.longest_s}s` : ""}) in the past ${state.stream.stalls.window_days} days`}
+                  ? `OBS feed: no delivery gaps over 0.5s in the past ${state.stream.stalls.window_days} days`
+                  : `OBS feed: rode out ${state.stream.stalls.over_half_s} delivery gap${state.stream.stalls.over_half_s === 1 ? "" : "s"} over 0.5s (${state.stream.stalls.over_1s} over 1s${state.stream.stalls.longest_s != null ? `, longest ${state.stream.stalls.longest_s}s` : ""}) in the past ${state.stream.stalls.window_days} days`}
               </p>
             )}
           </article>
@@ -847,7 +870,7 @@ export default function Home() {
         </section>
 
         <section className="metrics-grid" id="metrics" aria-label="Stream health">
-          <ContributionPanel signal={state.stream.signal} media={state.stream.media} programMode={programMode} />
+          <ContributionPanel signal={state.stream.signal} media={state.stream.media} programMode={programMode} stalls={state.stream.stalls} />
           <OutputsPanel destinations={state.destinations} />
         </section>
 

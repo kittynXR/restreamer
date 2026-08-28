@@ -1442,6 +1442,42 @@ class StallProbeTest(unittest.TestCase):
         # but a fresh connection starts a fresh ledger entry.
         self.assertIsNone(probe.observe("studio", "conn-2", 500, 14.0))
 
+    def test_an_ongoing_stall_is_visible_at_the_ultra_threshold(self) -> None:
+        probe = main.StallProbe()
+        probe.observe("studio", "conn-1", 1000, 10.0)
+        probe.observe("studio", "conn-1", 2000, 10.25)   # last advance
+        probe.observe("studio", "conn-1", 2000, 10.5)
+        probe.observe("studio", "conn-1", 2000, 10.75)
+        stalled = probe.stall_in_progress("studio", 10.75)
+        self.assertAlmostEqual(stalled, 0.5)
+        self.assertGreaterEqual(stalled, main.ULTRA_FAILOVER_STALL_SECONDS)
+
+    def test_a_healthy_feed_never_reaches_the_ultra_threshold(self) -> None:
+        probe = main.StallProbe()
+        for tick in range(20):
+            moment = 10.0 + tick * 0.25
+            probe.observe("studio", "conn-1", 1000 * (tick + 1), moment)
+            stalled = probe.stall_in_progress("studio", moment)
+            self.assertLess(stalled, main.ULTRA_FAILOVER_STALL_SECONDS)
+
+    def test_a_stale_probe_reading_reports_no_stall(self) -> None:
+        """If the probe itself has not polled recently, the age of the last
+        advance is unknowable and must not feed the ultra kick."""
+        probe = main.StallProbe()
+        probe.observe("studio", "conn-1", 1000, 10.0)
+        probe.observe("studio", "conn-1", 2000, 10.25)
+        self.assertIsNone(probe.stall_in_progress("studio", 12.0))
+
+    def test_ultra_sits_between_probe_resolution_and_the_backstop(self) -> None:
+        """0.5 s needs two probe ticks of silence to establish, and the 1.5 s
+        sampler-based kick stays behind it as the backstop."""
+        self.assertGreaterEqual(
+            main.ULTRA_FAILOVER_STALL_SECONDS, main.STALL_PROBE_INTERVAL_SECONDS * 2
+        )
+        self.assertLess(
+            main.ULTRA_FAILOVER_STALL_SECONDS, main.FAST_FAILOVER_STALL_SECONDS
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
