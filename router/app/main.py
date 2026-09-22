@@ -1196,14 +1196,17 @@ async def ensure_slate_variants() -> None:
             log.info("rendered slate variant %sx%sp%g", width, height, fps)
 
 
-def replace_seeded_slate(source: Path, brb: Path, active: Path) -> None:
+def replace_seeded_slate(source: Path, brb: Path, active: Path | None) -> None:
     """Swap a seeded slate without ever exposing a torn file.
 
     active.mp4 goes through .pending.mp4 and os.replace for the same reason every
-    other screen swap here does: MediaMTX may be reading it at any moment.
+    other screen swap here does: MediaMTX may be reading it at any moment. It is
+    left alone when None: the BRB screen is not what is on air right now.
     """
     brb.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, brb)
+    if active is None:
+        return
     pending = active.with_suffix(".pending.mp4")
     shutil.copyfile(source, pending)
     os.replace(pending, active)
@@ -1223,7 +1226,15 @@ async def refresh_stream_slate(stream_id: int, slug: str) -> None:
     # means this stream is already on the right one.
     if brb.exists() and brb.stat().st_size == source.stat().st_size:
         return
-    await asyncio.to_thread(replace_seeded_slate, source, brb, active_media_path(slug))
+    # This runs on the online edge and at boot, both of which can coincide with
+    # a takeover: active.mp4 then carries the user's Starting Soon screen, not
+    # the slate, and rewriting it would put BRB on air with Starting Soon lit --
+    # the same clobber _prepare_brb guards against. Decide under the activation
+    # lock so a takeover's swap cannot slip between the check and the write.
+    lock = _activation_locks.setdefault(slug, asyncio.Lock())
+    async with lock:
+        active = active_media_path(slug) if current_screen_mode(stream_id) == "brb" else None
+        await asyncio.to_thread(replace_seeded_slate, source, brb, active)
     log.info("re-seeded %s slate at %sx%sp%g", slug, *variant)
     # MediaMTX fixed the path's parameter sets from the previous file when the
     # path was created, so the new slate reaches the wire only once the path is
@@ -2835,6 +2846,14 @@ class FailoverAdManager:
     async def _prepare_brb(self, stream: sqlite3.Row) -> None:
         await self._learn_contribution(stream)
         if not media_asset_path(stream["slug"], "brb").exists():
+            return
+        # The caller sampled the program mode before probing, and the probe
+        # ffprobes the live feed for seconds. A manual takeover landing inside
+        # that await has already put its own screen on active.mp4, so staging
+        # BRB now would overwrite the screen the user just selected and leave
+        # the dashboard reading "starting soon" over a BRB file. Re-read the
+        # mode instead of trusting the pre-probe sample.
+        if current_program_mode(stream["id"]) != "live":
             return
         try:
             await activate_screen_file(stream, "brb", reload_path=False)

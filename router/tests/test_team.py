@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import gc
 import os
 import shutil
@@ -209,6 +210,132 @@ class DestinationMigrationTest(unittest.TestCase):
         self.assertEqual(after_restart["YouTube"], 1)
         self.assertEqual(after_restart["X"], 1)
         self.assertEqual(after_restart["Twitch"], 0)
+
+
+class FailoverPrestageRaceTest(unittest.TestCase):
+    """A manual takeover must survive the BRB pre-stage that races it.
+
+    `_prepare_brb` runs on the offline-to-online edge and starts by probing the
+    live feed with ffprobe, which takes seconds. The loop sampled the program
+    mode *before* that await, so a `PATCH /api/screens/mode` landing during the
+    probe had already written its own screen over `active.mp4` by the time the
+    pre-stage resumed -- and the pre-stage then copied BRB over it. Production
+    showed exactly that: `program_mode:1` read `starting_soon` while
+    `screen_mode:1` read `brb`, written 6ms after the probe stored its profile,
+    so the user got the BRB screen with the Starting Soon button lit.
+
+    Like `DestinationMigrationTest` this never starts the app: it points
+    `main.DB_PATH` at a throwaway file and drives the manager method directly.
+    """
+
+    def _prepare(self, mode_during_probe: str) -> tuple[bool, str]:
+        db = TEST_ROOT / f"race-{mode_during_probe}" / "relay.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        original_db_path = main.DB_PATH
+        main.DB_PATH = db
+        try:
+            main.initialize_db()
+            with main.connect() as conn:
+                conn.execute(
+                    "INSERT INTO users (id, username, display_name, password_hash,"
+                    " role, created_at) VALUES (1, 'kittyn', 'kittyn', 'x',"
+                    " 'owner', ?)",
+                    (main.now(),),
+                )
+                conn.execute(
+                    "INSERT INTO streams (id, user_id, slug, publish_user,"
+                    " publish_password_enc, created_at) VALUES"
+                    " (1, 1, 'studio', 'pub_test', ?, ?)",
+                    (main.encrypt("pw"), main.now()),
+                )
+            stream = {"id": 1, "slug": "studio"}
+            main.media_asset_path("studio", "brb").write_bytes(b"brb")
+            main.set_program_mode(1, "live")
+
+            manager = main.FailoverAdManager()
+
+            async def learn(_stream: object) -> None:
+                # Stands in for the ffprobe round trip: the takeover lands here.
+                main.set_program_mode(1, mode_during_probe)
+
+            manager._learn_contribution = learn
+            activate = AsyncMock()
+            with patch.object(main, "activate_screen_file", activate):
+                asyncio.run(manager._prepare_brb(stream))
+            return activate.await_count > 0, main.current_program_mode(1)
+        finally:
+            main.DB_PATH = original_db_path
+
+    def test_takeover_during_the_probe_keeps_its_own_screen(self) -> None:
+        staged, mode = self._prepare("starting_soon")
+        self.assertEqual(mode, "starting_soon")
+        self.assertFalse(
+            staged,
+            "pre-stage overwrote the screen the takeover had just activated",
+        )
+
+    def test_still_stages_brb_when_the_stream_stays_live(self) -> None:
+        staged, mode = self._prepare("live")
+        self.assertEqual(mode, "live")
+        self.assertTrue(staged, "failover cover was not staged for a live stream")
+
+    def _refresh(self, screen_mode: str) -> tuple[bytes, bytes]:
+        """Re-seed a seeded slate while `screen_mode` is on active.mp4.
+
+        Returns what brb.mp4 and active.mp4 hold afterwards. The stream has no
+        media_assets row for brb, so the slate is ours to replace; the variant
+        is pre-written because there is no ffmpeg here.
+        """
+        db = TEST_ROOT / f"refresh-{screen_mode}" / "relay.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        original_db_path = main.DB_PATH
+        main.DB_PATH = db
+        try:
+            main.initialize_db()
+            with main.connect() as conn:
+                conn.execute(
+                    "INSERT INTO users (id, username, display_name, password_hash,"
+                    " role, created_at) VALUES (1, 'kittyn', 'kittyn', 'x',"
+                    " 'owner', ?)",
+                    (main.now(),),
+                )
+                conn.execute(
+                    "INSERT INTO streams (id, user_id, slug, publish_user,"
+                    " publish_password_enc, created_at) VALUES"
+                    " (1, 1, 'studio', 'pub_test', ?, ?)",
+                    (main.encrypt("pw"), main.now()),
+                )
+            variant = main.slate_variant_path(
+                main.snap_slate_variant(main.contribution_profile(1))
+            )
+            variant.parent.mkdir(parents=True, exist_ok=True)
+            variant.write_bytes(b"fresh-slate-variant")
+            main.media_asset_path("studio", "brb").write_bytes(b"stale-slate")
+            main.active_media_path("studio").write_bytes(b"starting-soon-screen")
+            main.set_screen_mode(1, screen_mode)
+            with (
+                patch.object(main, "ensure_slate_variants", AsyncMock()),
+                patch.object(main, "reload_fallback_path", AsyncMock()),
+            ):
+                asyncio.run(main.refresh_stream_slate(1, "studio"))
+            return (
+                main.media_asset_path("studio", "brb").read_bytes(),
+                main.active_media_path("studio").read_bytes(),
+            )
+        finally:
+            main.DB_PATH = original_db_path
+
+    def test_reseed_leaves_a_starting_soon_screen_on_air(self) -> None:
+        brb, active = self._refresh("starting_soon")
+        self.assertEqual(brb, b"fresh-slate-variant")
+        self.assertEqual(
+            active, b"starting-soon-screen", "re-seed put the slate over the takeover"
+        )
+
+    def test_reseed_updates_active_while_brb_is_on_air(self) -> None:
+        brb, active = self._refresh("brb")
+        self.assertEqual(brb, b"fresh-slate-variant")
+        self.assertEqual(active, b"fresh-slate-variant")
 
 
 class TeamInvitationFlowTest(unittest.TestCase):
