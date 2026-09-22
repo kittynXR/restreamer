@@ -66,7 +66,7 @@ MEDIA_MAX_BYTES = 2 * 1024 * 1024 * 1024
 # Every takeover parses this file's moov atom once per track before the first
 # slate frame reaches a viewer, so the cap is a handoff-latency budget, not just
 # a disk limit. Shorter screens hand off faster; 30 seconds is ideal for BRB.
-MEDIA_MAX_DURATION_SECONDS = 5 * 60
+MEDIA_MAX_DURATION_SECONDS = 10 * 60
 INVITE_DEFAULT_DAYS = 7
 INVITE_MAX_DAYS = 30
 
