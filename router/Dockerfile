@@ -1,7 +1,12 @@
 FROM python:3.13-slim
 
-ARG FFMPEG_RELEASE=autobuild-2026-08-20-13-45
-ARG FFMPEG_ARCHIVE=ffmpeg-n8.1.2-44-g7c533d0f86-linux64-gpl-8.1.tar.xz
+# BtbN prunes dated autobuilds after a few weeks, so this pin rots: a rebuild
+# that misses the Docker layer cache (a base-image update is enough) then 404s.
+# When that happens, pick a current tag from
+# https://api.github.com/repos/BtbN/FFmpeg-Builds/releases and keep the
+# linux64-gpl-8.x archive -- Twitch's dual-track encapsulation needs 8.x.
+ARG FFMPEG_RELEASE=autobuild-2026-09-21-13-55
+ARG FFMPEG_ARCHIVE=ffmpeg-n8.1.3-linux64-gpl-8.1.tar.xz
 
 ENV PYTHONDONTWRITEBYTECODE=1     PYTHONUNBUFFERED=1     PATH=/opt/ffmpeg/bin:$PATH
 
