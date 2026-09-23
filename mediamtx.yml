@@ -33,8 +33,18 @@ webrtc: false
 srt: true
 srtAddress: :8890
 
+# Two paths per stream. OBS publishes to the bare slug (the ingest); the
+# forwarders and the monitor read <slug>/program, which the router feeds from
+# the ingest with an internal copy while live input is on air and which falls
+# back to active.mp4 whenever that copy is stopped. That split is what lets OBS
+# stay connected while Starting Soon or BRB is on air. The router creates both
+# paths for every other stream through the API; "studio" is static because its
+# always-available file must resolve at config load.
 paths:
   studio:
+    source: publisher
+    overridePublisher: true
+  studio/program:
     source: publisher
     overridePublisher: true
     alwaysAvailable: true

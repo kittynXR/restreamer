@@ -43,6 +43,9 @@ MEDIA_INTERNAL_PASS = os.environ["MEDIA_INTERNAL_PASS"]
 MEDIAMTX_API = os.getenv("MEDIAMTX_API", "http://mediamtx:9997")
 MEDIAMTX_HLS = os.getenv("MEDIAMTX_HLS", "http://mediamtx:8888")
 MEDIAMTX_RTSP = os.getenv("MEDIAMTX_RTSP", "mediamtx:8554")
+# Where MediaMTX sees the relay_data volume. The router writes active.mp4 under
+# DB_PATH.parent/media; this is the same directory from MediaMTX's side.
+MEDIAMTX_MEDIA_ROOT = os.getenv("MEDIAMTX_MEDIA_ROOT", "/relay-data/media")
 PASSWORDS = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
 USERNAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,31}$")
 TWITCH_INGESTS_URL = "https://ingest.twitch.tv/ingests"
@@ -179,6 +182,18 @@ WORKER_RETRY_MAX_SECONDS = 30.0
 WORKER_HEALTHY_SECONDS = 30.0
 WORKER_STALL_SECONDS = 20.0
 WORKER_ERROR_LINES = 20
+# The ingest→program copy (ProgramSwitch). Its retries are shorter than a
+# forwarder's because every second it is down is a second the backup screen
+# is on air instead of OBS.
+PROGRAM_SWITCH_RETRY_MIN_SECONDS = 0.5
+PROGRAM_SWITCH_RETRY_MAX_SECONDS = 30.0
+PROGRAM_SWITCH_HEALTHY_SECONDS = 10.0
+PROGRAM_SWITCH_STALL_SECONDS = 10.0
+# Consecutive 1 s samples with OBS gone before a still-running copy is killed.
+# MediaMTX closes the copy's read session itself when the publisher leaves, so
+# this only catches a copy whose input somehow outlived the publisher.
+PROGRAM_SWITCH_OFFLINE_SAMPLES = 3
+PROGRAM_SWITCH_ERROR_LINES = 10
 TWITCH_FALLBACK = {
     "name": "US West (Oregon)",
     "url_template_secure": "rtmps://usw20.contribute.live-video.net/app/{stream_key}",
@@ -894,10 +909,8 @@ async def probe_contribution(slug: str) -> dict[str, Any] | None:
     Everything here comes out of the bitstream itself, so it works for any
     encoder a streamer happens to use rather than assuming one setup.
     """
-    source = (
-        f"rtsp://{quote(MEDIA_INTERNAL_USER, safe='')}:{quote(MEDIA_INTERNAL_PASS, safe='')}"
-        f"@{MEDIAMTX_RTSP}/{slug}"
-    )
+    # The ingest path: OBS's own bitstream, never the screen on the program path.
+    source = internal_rtsp_url(slug)
     command = [
         "ffprobe", "-v", "error", "-rtsp_transport", "tcp",
         "-select_streams", "v:0",
@@ -1300,48 +1313,96 @@ def seed_stream_media(slug: str) -> bool:
     return True
 
 
-def fallback_path_config(slug: str, with_fallback: bool = True) -> dict[str, Any]:
+def program_path(slug: str) -> str:
+    """The MediaMTX path the forwarders and the monitor read.
+
+    OBS publishes to the bare slug, so its SRT address never changes. This second
+    path carries whatever is actually on air: OBS, by way of the ProgramSwitch
+    copy, or active.mp4 whenever that copy is stopped. Keeping the two apart is
+    what lets OBS stay connected while a screen is on air — an always-available
+    file only plays while nothing publishes to its path, so on a single path the
+    only way to hold a screen was to refuse OBS.
+    """
+    return f"{slug}/program"
+
+
+def internal_rtsp_url(name: str) -> str:
+    """Internal RTSP address of a MediaMTX path. Carries credentials: redact it."""
+    return (
+        f"rtsp://{quote(MEDIA_INTERNAL_USER, safe='')}:{quote(MEDIA_INTERNAL_PASS, safe='')}"
+        f"@{MEDIAMTX_RTSP}/{name}"
+    )
+
+
+def ingest_path_config() -> dict[str, Any]:
+    # Explicit falses, not omissions: _ensure_path only PATCHes keys that differ,
+    # and a path created before the split still carries the always-available
+    # file. Left there, it would play the screen to the copy while OBS is away
+    # and the copy would never see OBS leave.
+    return {
+        "source": "publisher",
+        "overridePublisher": True,
+        "alwaysAvailable": False,
+        "alwaysAvailableFile": "",
+    }
+
+
+def program_path_config(slug: str, with_fallback: bool = True) -> dict[str, Any]:
     config: dict[str, Any] = {"source": "publisher", "overridePublisher": True}
     if with_fallback:
         config["alwaysAvailable"] = True
-        config["alwaysAvailableFile"] = f"/relay-data/media/{slug}/active.mp4"
+        config["alwaysAvailableFile"] = f"{MEDIAMTX_MEDIA_ROOT}/{slug}/active.mp4"
     return config
 
 
-async def ensure_fallback_path(slug: str) -> bool:
-    # Path creation must not depend on a slate existing: an invited streamer with
-    # no uploads still needs somewhere to publish. Only the always-available keys
-    # are conditional.
-    seeded = seed_stream_media(slug)
-    encoded = quote(slug, safe="")
-    payload = fallback_path_config(slug, with_fallback=seeded)
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.get(f"{MEDIAMTX_API}/v3/config/paths/get/{encoded}")
-        if response.status_code == 404:
-            response = await client.post(
-                f"{MEDIAMTX_API}/v3/config/paths/add/{encoded}",
-                json=payload,
-            )
-            response.raise_for_status()
-            log.info("created MediaMTX path for %s (fallback=%s)", slug, seeded)
-            return True
+def _encode_path(name: str) -> str:
+    # The program path carries a slash. MediaMTX's API reads the whole remainder
+    # of the URL as the name, so the slash travels as itself.
+    return quote(name, safe="/")
+
+
+async def _ensure_path(client: httpx.AsyncClient, name: str, payload: dict[str, Any]) -> bool:
+    """Create or correct one MediaMTX path config. True when it was created."""
+    encoded = _encode_path(name)
+    response = await client.get(f"{MEDIAMTX_API}/v3/config/paths/get/{encoded}")
+    if response.status_code == 404:
+        response = await client.post(f"{MEDIAMTX_API}/v3/config/paths/add/{encoded}", json=payload)
         response.raise_for_status()
-        current = response.json()
-        if any(current.get(key) != value for key, value in payload.items()):
-            response = await client.patch(
-                f"{MEDIAMTX_API}/v3/config/paths/patch/{encoded}",
-                json=payload,
-            )
-            response.raise_for_status()
-            log.info("updated MediaMTX path config for %s", slug)
+        return True
+    response.raise_for_status()
+    current = response.json()
+    if any(current.get(key) != value for key, value in payload.items()):
+        response = await client.patch(f"{MEDIAMTX_API}/v3/config/paths/patch/{encoded}", json=payload)
+        response.raise_for_status()
+        log.info("updated MediaMTX path config for %s", name)
+    return False
+
+
+async def ensure_fallback_path(slug: str) -> bool:
+    """Make sure both of a stream's paths exist and are configured.
+
+    Path creation must not depend on a slate existing: an invited streamer with
+    no uploads still needs somewhere to publish. Only the program path's
+    always-available keys are conditional.
+    """
+    seeded = seed_stream_media(slug)
+    async with httpx.AsyncClient(timeout=10) as client:
+        return await _ensure_stream_paths(client, slug, seeded)
+
+
+async def _ensure_stream_paths(client: Any, slug: str, seeded: bool) -> bool:
+    if await _ensure_path(client, slug, ingest_path_config()):
+        log.info("created MediaMTX ingest path for %s", slug)
+    if await _ensure_path(client, program_path(slug), program_path_config(slug, with_fallback=seeded)):
+        log.info("created MediaMTX program path for %s (fallback=%s)", slug, seeded)
     return True
 
 
-async def path_is_idle(slug: str) -> bool:
+async def path_is_idle(name: str) -> bool:
     """True when nothing is publishing to or reading from this path."""
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.get(f"{MEDIAMTX_API}/v3/paths/get/{quote(slug, safe='')}")
+            response = await client.get(f"{MEDIAMTX_API}/v3/paths/get/{_encode_path(name)}")
             if response.status_code == 404:
                 return True
             response.raise_for_status()
@@ -1361,16 +1422,16 @@ async def reload_fallback_path(slug: str) -> bool:
     MediaMTX reads the always-available file's parameter sets when the path is
     created and the offline player keeps its own descriptors open, so replacing
     active.mp4 has no effect until the path is recreated. Recreating disconnects
-    whoever is attached, so it only happens when the path is genuinely idle;
-    otherwise the new screen goes on air at the next reconnect.
+    whoever is attached, so it only happens when the program path is genuinely
+    idle; otherwise the new screen goes on air at the next reconnect.
     """
-    if not await path_is_idle(slug):
+    name = program_path(slug)
+    if not await path_is_idle(name):
         log.info("staged screen change for %s; path is in use", slug)
         return False
-    encoded = quote(slug, safe="")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.delete(f"{MEDIAMTX_API}/v3/config/paths/delete/{encoded}")
+            response = await client.delete(f"{MEDIAMTX_API}/v3/config/paths/delete/{_encode_path(name)}")
             if response.status_code != 404:
                 response.raise_for_status()
         await ensure_fallback_path(slug)
@@ -1400,15 +1461,16 @@ async def kick_stream_publishers(slug: str) -> None:
 
 
 async def remove_fallback_path(slug: str) -> None:
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.delete(
-                f"{MEDIAMTX_API}/v3/config/paths/delete/{quote(slug, safe='')}"
-            )
-            if response.status_code != 404:
-                response.raise_for_status()
-    except Exception:
-        pass
+    for name in (program_path(slug), slug):
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.delete(
+                    f"{MEDIAMTX_API}/v3/config/paths/delete/{_encode_path(name)}"
+                )
+                if response.status_code != 404:
+                    response.raise_for_status()
+        except Exception:
+            pass
 
 
 class PathReconciler:
@@ -1441,6 +1503,8 @@ class PathReconciler:
             except Exception as exc:
                 # Slug only — never the file path or any credential.
                 log.warning("path reconcile failed for %s: %s", slug, exc)
+            program_switch.ensure(slug)
+        program_switch.prune(set(slugs))
         # Re-arm any destination whose worker died for good; start() no-ops when
         # a task is already running, so this is cheap and idempotent.
         try:
@@ -1760,7 +1824,7 @@ class MediaConversionManager:
                 encoder_fingerprint=contribution_fingerprint(profile),
             )
             mode = current_screen_mode(stream["id"])
-            status = await media_status(stream["slug"])
+            status = await program_status(stream["slug"])
             try:
                 if kind == mode:
                     await activate_screen_file(stream, kind, reload_path=not status["online"])
@@ -2199,11 +2263,13 @@ class WorkerManager:
                         # not retried forever.
                         pinned_output_url, pinned_backup_url = self._destination_urls(row)
                     output_url = pinned_output_url
-                    source = (
-                        f"rtsp://{quote(MEDIA_INTERNAL_USER, safe='')}:{quote(MEDIA_INTERNAL_PASS, safe='')}"
-                        f"@{MEDIAMTX_RTSP}/{row['slug']}"
-                    )
-                    media = await media_status(row["slug"])
+                    # The program path, never the ingest: a screen on air is a
+                    # screen the forwarders must carry. With a seeded stream
+                    # its track count is the screen's two whether OBS is on
+                    # air or not, so the mapping is decided against the file's
+                    # layout, which MediaMTX requires OBS to match anyway.
+                    source = internal_rtsp_url(program_path(row["slug"]))
+                    media = await program_status(row["slug"])
                     command = [
                         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
                         "-rtsp_transport", "tcp",
@@ -2365,6 +2431,322 @@ class WorkerManager:
 workers = WorkerManager()
 
 
+async def end_process(process: asyncio.subprocess.Process) -> None:
+    """SIGTERM, a two-second grace for an orderly RTSP teardown, then SIGKILL."""
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
+class ProgramSwitch:
+    """Puts OBS on air, and takes it off again, without touching OBS itself.
+
+    One `-c copy` ffmpeg per stream reads the ingest path and publishes it to
+    the program path. It runs only while two things hold: the operator wants
+    live input on air (`desired`, written by the screen routes) and OBS is
+    actually publishing. Stopping it is the takeover — the program path drops to
+    active.mp4 the moment the copy's publish session ends, and the forwarders
+    reading that path stay attached — while OBS's own SRT connection is never
+    touched, so OBS can sit connected behind Starting Soon for as long as it
+    likes and go on air the instant the operator returns to live.
+
+    `desired` lives here, in memory, and only the routes write it. The loop must
+    never re-read the program mode from the database: a takeover writes the
+    mode, then swaps active.mp4, then stops the copy, and MediaMTX opens the
+    file by name at that stop. A loop that stopped the copy between the first two
+    steps would put the previous screen on air.
+    """
+
+    def __init__(self) -> None:
+        self.tasks: dict[str, asyncio.Task] = {}
+        self.desired: dict[str, bool] = {}
+        self.wakeups: dict[str, asyncio.Event] = {}
+        self.locks: dict[str, asyncio.Lock] = {}
+        self.processes: dict[str, asyncio.subprocess.Process] = {}
+        self.status: dict[str, dict[str, Any]] = {}
+        self.stopping = False
+
+    def _lock(self, slug: str) -> asyncio.Lock:
+        return self.locks.setdefault(slug, asyncio.Lock())
+
+    def _wakeup(self, slug: str) -> asyncio.Event:
+        return self.wakeups.setdefault(slug, asyncio.Event())
+
+    def _set_state(self, slug: str, state: str, error: str | None = None) -> None:
+        self.status[slug] = {"state": state, "last_error": error, "since": time.monotonic()}
+
+    def snapshot(self, slug: str) -> dict[str, Any]:
+        """For /api/state: `stopped` (a screen is on air), `waiting` (live input
+        wanted, OBS absent), `running` (OBS on air), `retrying` (the copy died
+        and `last_error` says why, in words the dashboard can show)."""
+        entry = self.status.get(slug)
+        if entry is None:
+            return {"state": "stopped", "last_error": None, "since_s": None}
+        return {
+            "state": entry["state"],
+            "last_error": entry["last_error"],
+            "since_s": round(time.monotonic() - entry["since"], 1),
+        }
+
+    @staticmethod
+    def command(source: str, output: str) -> list[str]:
+        return [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
+            "-fflags", "+nobuffer",
+            "-rtsp_transport", "tcp",
+            # Without this a stalled RTSP session blocks forever.
+            "-timeout", "10000000",
+            "-i", source,
+            "-progress", "pipe:1", "-stats_period", "1",
+            # Every track, in order, untouched: the forwarders map 0:a:0 and
+            # 0:a:1 off the program path, and MediaMTX only lets a publisher
+            # onto an always-available path whose layout matches the file's.
+            "-map", "0", "-c", "copy",
+            "-f", "rtsp", "-rtsp_transport", "tcp", output,
+        ]
+
+    async def start(self) -> None:
+        self.stopping = False
+        with connect() as conn:
+            slugs = [
+                row["slug"]
+                for row in conn.execute(
+                    """SELECT s.slug FROM streams s JOIN users u ON u.id = s.user_id
+                       WHERE u.enabled = 1 ORDER BY s.id"""
+                )
+            ]
+        for slug in slugs:
+            self.ensure(slug)
+
+    async def shutdown(self) -> None:
+        self.stopping = True
+        tasks = [task for task in self.tasks.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def ensure(self, slug: str) -> None:
+        """Run the loop for this stream. The first call seeds `desired` from the
+        stored program mode; after that only wake() and stop() change it."""
+        if slug not in self.desired:
+            with connect() as conn:
+                row = conn.execute("SELECT id FROM streams WHERE slug = ?", (slug,)).fetchone()
+            self.desired[slug] = bool(row) and current_program_mode(row["id"]) == "live"
+        task = self.tasks.get(slug)
+        if task is None or task.done():
+            self.tasks[slug] = asyncio.create_task(self._run(slug))
+
+    def prune(self, keep: set[str]) -> None:
+        for slug in list(self.tasks):
+            if slug not in keep:
+                self.forget(slug)
+
+    def forget(self, slug: str) -> None:
+        task = self.tasks.pop(slug, None)
+        if task and not task.done():
+            task.cancel()
+        self.desired.pop(slug, None)
+        self.status.pop(slug, None)
+
+    def wake(self, slug: str) -> None:
+        """Live input is wanted: start the copy as soon as OBS is there."""
+        self.desired[slug] = True
+        self._wakeup(slug).set()
+
+    async def stop(self, slug: str) -> None:
+        """A screen is going on air. Returns only once the copy is gone, so the
+        caller's reply means the program path is on the file.
+
+        Takes a bare slug with no ownership predicate — resolve the caller's
+        stream first, as with kick_stream_publishers.
+        """
+        self.desired[slug] = False
+        async with self._lock(slug):
+            process = self.processes.pop(slug, None)
+            if process and process.returncode is None:
+                await end_process(process)
+        self._wakeup(slug).set()
+
+    async def _ready(self, slug: str) -> bool:
+        """OBS is publishing, the program path exists, and bytes are moving.
+
+        A MediaMTX that cannot be reached answers False here — hold, never act
+        on a reading that does not exist (invariant 9).
+        """
+        ingest = await media_status(slug)
+        if not ingest.get("known", True) or not ingest["online"]:
+            return False
+        program = await program_status(slug)
+        if not program.get("known", True) or not program["available"]:
+            return False
+        stalled = signal_metrics.stalled_for(slug)
+        return stalled is None or stalled < 1.0
+
+    @staticmethod
+    async def _pause(wakeup: asyncio.Event, seconds: float) -> None:
+        try:
+            await asyncio.wait_for(wakeup.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
+    async def _explain(self, slug: str, errors: list[str], code: int | None) -> str:
+        """Why the copy died, in the operator's terms where that is possible.
+
+        MediaMTX refuses a publisher whose track layout differs from the
+        always-available file's, and ffmpeg only ever sees the RTSP status
+        line, so the layouts are compared here to say what actually went wrong.
+        """
+        if any(re.search(r"method (ANNOUNCE|RECORD) failed", line) for line in errors):
+            sending = audio_track_count(await media_status(slug))
+            expected = audio_track_count(await program_status(slug))
+            if sending is not None and expected is not None and sending != expected:
+                return (
+                    f"OBS is sending {sending} audio track{'' if sending == 1 else 's'}, but this "
+                    f"stream's screens carry {expected}. Relay cannot put OBS on air until OBS "
+                    "sends exactly Tracks 1 and 2."
+                )
+            return (
+                "Relay could not attach OBS to the program feed. Check that OBS sends exactly "
+                "Tracks 1 and 2 as AAC."
+            )
+        return " · ".join(errors[-3:]) or f"Program copy exited with code {code}"
+
+    async def _run(self, slug: str) -> None:
+        source = internal_rtsp_url(slug)
+        output = internal_rtsp_url(program_path(slug))
+        wakeup = self._wakeup(slug)
+        failures = 0
+        process: asyncio.subprocess.Process | None = None
+        try:
+            while True:
+                # Cleared before the state is read, so a wake() landing during
+                # the checks below is not lost.
+                wakeup.clear()
+                try:
+                    if not self.desired.get(slug):
+                        self._set_state(slug, "stopped")
+                        await self._pause(wakeup, 1.0)
+                        continue
+                    if not await self._ready(slug):
+                        self._set_state(slug, "waiting")
+                        await self._pause(wakeup, 1.0)
+                        continue
+                    # Spawned under the same lock stop() takes, so a takeover
+                    # either sees no process and the loop sees desired=False,
+                    # or sees the process and ends it. Never a copy that
+                    # outlives the decision to stop it.
+                    async with self._lock(slug):
+                        if not self.desired.get(slug):
+                            continue
+                        process = await asyncio.create_subprocess_exec(
+                            *self.command(source, output),
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        self.processes[slug] = process
+                    started = time.monotonic()
+                    self._set_state(slug, "running")
+                    errors: deque[str] = deque(maxlen=PROGRAM_SWITCH_ERROR_LINES)
+                    heartbeat: dict[str, float | None] = {"sampled_at": None}
+
+                    async def read_progress(pipe: asyncio.StreamReader) -> None:
+                        async for _sample in progress_samples(pipe):
+                            heartbeat["sampled_at"] = time.monotonic()
+
+                    async def drain_stderr(pipe: asyncio.StreamReader) -> None:
+                        async for raw_line in pipe:
+                            line = raw_line.decode(errors="replace").strip()
+                            if line:
+                                errors.append(redact(line, source, output))
+
+                    assert process.stdout is not None and process.stderr is not None
+                    readers = [
+                        asyncio.create_task(read_progress(process.stdout)),
+                        asyncio.create_task(drain_stderr(process.stderr)),
+                    ]
+                    try:
+                        code = await self._supervise(slug, process, heartbeat, started)
+                    finally:
+                        for reader in readers:
+                            reader.cancel()
+                        await asyncio.gather(*readers, return_exceptions=True)
+                    self.processes.pop(slug, None)
+                    process = None
+                    if self.stopping:
+                        return
+                    if not self.desired.get(slug):
+                        # Ended by stop(): a screen went on air. Not a failure.
+                        failures = 0
+                        self._set_state(slug, "stopped")
+                        continue
+                    if time.monotonic() - started >= PROGRAM_SWITCH_HEALTHY_SECONDS:
+                        failures = 0
+                    else:
+                        failures += 1
+                    detail = await self._explain(slug, list(errors), code)
+                    self._set_state(slug, "retrying", detail)
+                    log.warning("program copy for %s ended: %s", slug, detail)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failures += 1
+                    self._set_state(slug, "retrying", redact(str(exc), source, output))
+                    log.warning("program copy for %s error: %s", slug, redact(str(exc), source, output))
+                delay = min(
+                    PROGRAM_SWITCH_RETRY_MAX_SECONDS,
+                    PROGRAM_SWITCH_RETRY_MIN_SECONDS * (2 ** min(failures, 6)),
+                )
+                await self._pause(wakeup, delay * random.uniform(0.7, 1.3))
+        except asyncio.CancelledError:
+            if process and process.returncode is None:
+                await end_process(process)
+            raise
+        finally:
+            self.processes.pop(slug, None)
+
+    async def _supervise(
+        self,
+        slug: str,
+        process: asyncio.subprocess.Process,
+        heartbeat: dict[str, float | None],
+        started: float,
+    ) -> int | None:
+        """Wait for the copy, killing one whose input is gone or wedged.
+
+        MediaMTX closes the copy's read session when OBS leaves, so the normal
+        end is an input EOF; the checks here are for the copy that somehow
+        outlives its publisher, and the one that stops reporting.
+        """
+        waiter = asyncio.ensure_future(process.wait())
+        offline = 0
+        try:
+            while True:
+                done, _ = await asyncio.wait({waiter}, timeout=1.0)
+                if done:
+                    return waiter.result()
+                ingest = await media_status(slug)
+                if ingest.get("known", True):
+                    offline = 0 if ingest["online"] else offline + 1
+                reference = heartbeat["sampled_at"] or started
+                if (
+                    offline >= PROGRAM_SWITCH_OFFLINE_SAMPLES
+                    or time.monotonic() - reference > PROGRAM_SWITCH_STALL_SECONDS
+                ):
+                    log.warning("program copy for %s lost its input; restarting", slug)
+                    process.kill()
+                    return await waiter
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+
+
+program_switch = ProgramSwitch()
+
+
 class SignalMetrics:
     """Samples MediaMTX once per tick and keeps per-stream history in memory.
 
@@ -2432,7 +2814,9 @@ class SignalMetrics:
         self.readers = {}
         if not isinstance(rtsp, Exception):
             for item in rtsp:
-                if item.get("path"):
+                # Readers only: the ProgramSwitch copy holds a publish session on
+                # the program path, and it is not a forwarder.
+                if item.get("path") and item.get("state") == "read":
                     self.readers[item["path"]] = self.readers.get(item["path"], 0) + 1
         self.sampled_at = time.monotonic()
         for slug in self.paths:
@@ -2532,7 +2916,7 @@ class SignalMetrics:
             "frames_in_error": path.get("inboundFramesInError"),
             "bytes_received": entry.get("bytes"),
             "online_since": path.get("onlineTime") or path.get("readyTime"),
-            "reader_count": self.readers.get(slug, 0),
+            "reader_count": self.readers.get(program_path(slug), 0),
             "track_summary": self._describe_tracks(path),
             "stalled_for_s": (
                 round(self.stalled_for(slug), 1) if self.stalled_for(slug) is not None else None
@@ -3068,6 +3452,7 @@ async def lifespan(_: FastAPI):
     await path_reconciler.start()
     await signal_metrics.start()
     await stall_probe.start()
+    await program_switch.start()
     await workers.start_enabled()
     await failover_ads.start()
     await twitch_ingests.start(probe_now=False)
@@ -3078,6 +3463,8 @@ async def lifespan(_: FastAPI):
     await path_reconciler.shutdown()
     await media_conversions.shutdown()
     await workers.shutdown()
+    # After the forwarders, so the last frames they carried were live ones.
+    await program_switch.shutdown()
     await twitch_ingests.shutdown()
 
 
@@ -3278,7 +3665,7 @@ async def team_state(request: Request) -> dict[str, Any]:
                 "twitch_connected": bool(member["twitch_connected"]),
                 # Fleet health only. Per-stream detail stays on /api/state so the
                 # isolation boundary is unchanged.
-                "online": bool((signal_metrics.paths.get(member["slug"]) or {}).get("ready")),
+                "online": bool((signal_metrics.paths.get(member["slug"]) or {}).get("online")),
                 "receive_mbps": (signal_metrics.publishers.get(member["slug"]) or {}).get(
                     "mbpsReceiveRate"
                 ),
@@ -3377,10 +3764,13 @@ async def set_team_member_status(
             await ensure_fallback_path(member["slug"])
         except Exception:
             pass
+        program_switch.ensure(member["slug"])
         return {"status": "enabled"}
 
     for destination_id in destination_ids:
         await workers.stop(destination_id)
+    await program_switch.stop(member["slug"])
+    program_switch.forget(member["slug"])
     await kick_stream_publishers(member["slug"])
     await remove_fallback_path(member["slug"])
     return {"status": "suspended"}
@@ -3544,17 +3934,22 @@ async def change_screen_mode(body: ScreenModeBody, request: Request) -> dict[str
     user = require_user(request)
     require_csrf(request)
     stream = stream_for_user(user["id"])
-    status = await media_status(stream["slug"])
+    # The program path's state decides whether the file can be reopened now:
+    # reload declines while the forwarders read it, whatever OBS is doing.
+    status = await program_status(stream["slug"])
     if body.mode == "live":
         previous = current_program_mode(stream["id"])
         set_program_mode(stream["id"], "live")
         try:
             await activate_screen_file(stream, "brb", reload_path=not status["online"])
         except Exception:
-            # Do not leave OBS admitted while the screen it would fall back to
+            # Do not put OBS on air while the screen it would fall back to
             # failed to activate.
             set_program_mode(stream["id"], previous)
             raise
+        # OBS goes on air as soon as it is publishing — at once if it has been
+        # standing by behind the screen.
+        program_switch.wake(stream["slug"])
         return {"status": "live"}
 
     if not media_asset_path(stream["slug"], body.mode).exists():
@@ -3563,17 +3958,16 @@ async def change_screen_mode(body: ScreenModeBody, request: Request) -> dict[str
             detail=f"Upload the {body.mode.replace('_', ' ')} screen first",
         )
     previous = current_program_mode(stream["id"])
-    # Close the publish gate before the file swap. mediamtx_auth only admits a
-    # publisher while the program mode is "live", so setting it first means an
-    # OBS reconnect landing mid-swap is rejected rather than silently put to air.
     set_program_mode(stream["id"], body.mode)
     try:
         await activate_screen_file(stream, body.mode, reload_path=not status["online"])
     except Exception:
         set_program_mode(stream["id"], previous)
         raise
-    # Unconditionally, not just when the pre-swap sample said "online".
-    await kick_stream_publishers(stream["slug"])
+    # Swap first, stop second: MediaMTX opens active.mp4 by name at the moment
+    # the copy's publish session ends, so this order is what puts the chosen
+    # screen on air rather than the previous one. OBS itself is left connected.
+    await program_switch.stop(stream["slug"])
     return {"status": body.mode}
 
 def _path_state(path: dict[str, Any] | None) -> dict[str, Any]:
@@ -3613,6 +4007,16 @@ async def media_status(slug: str) -> dict[str, Any]:
         return {"known": False, "available": False, "online": False, "tracks": []}
 
 
+async def program_status(slug: str) -> dict[str, Any]:
+    """The program path: what the forwarders and viewers are actually getting.
+
+    `online` here means OBS is on air by way of the ProgramSwitch copy; `tracks`
+    are the file's while a screen plays. media_status(slug) is the ingest view,
+    and `online` there means OBS is connected — possibly standing by.
+    """
+    return await media_status(program_path(slug))
+
+
 @app.get("/api/state")
 async def state(request: Request) -> dict[str, Any]:
     user = require_user(request)
@@ -3647,6 +4051,12 @@ async def state(request: Request) -> dict[str, Any]:
             "slug": stream["slug"],
             "obs_url": obs_url,
             "media": await media_status(stream["slug"]),
+            # What is on air, as distinct from what OBS is sending: `media` is
+            # OBS's connection, `program` is what reaches the destinations.
+            "program": {
+                **await program_status(stream["slug"]),
+                "switch": program_switch.snapshot(stream["slug"]),
+            },
             "signal": signal_metrics.snapshot(stream["slug"]),
             "fast_failover": fast_failover_enabled(stream["id"]),
             "fast_failover_seconds": FAST_FAILOVER_STALL_SECONDS,
@@ -3871,20 +4281,27 @@ async def mediamtx_auth(request: Request) -> Response:
     password = payload.get("password") if isinstance(payload.get("password"), str) else ""
     if action == "api":
         return Response(status_code=204)
-    if action in {"read", "playback"} and secrets.compare_digest(user, MEDIA_INTERNAL_USER) and secrets.compare_digest(password, MEDIA_INTERNAL_PASS):
+    internal = secrets.compare_digest(user, MEDIA_INTERNAL_USER) and secrets.compare_digest(password, MEDIA_INTERNAL_PASS)
+    if action in {"read", "playback"} and internal:
         return Response(status_code=204)
     if action == "publish":
+        # The ProgramSwitch copy may publish only to a program path; the bare
+        # slug is OBS's, and the internal credentials are never accepted there.
+        if internal:
+            if path.endswith("/program"):
+                return Response(status_code=204)
+            return JSONResponse({"detail": "Forbidden"}, status_code=403)
+        # OBS is admitted whatever is on air. Its feed lands on the ingest path
+        # only; whether it reaches viewers is the ProgramSwitch's decision, so
+        # a publish during a takeover is a publisher standing by, not a fight
+        # with the screen.
         with connect() as conn:
             stream = conn.execute(
                 """SELECT s.* FROM streams s JOIN users u ON u.id = s.user_id
                    WHERE s.slug = ? AND s.publish_user = ? AND u.enabled = 1""",
                 (path, user),
             ).fetchone()
-        if (
-            stream
-            and current_program_mode(stream["id"]) == "live"
-            and secrets.compare_digest(password, decrypt(stream["publish_password_enc"]))
-        ):
+        if stream and secrets.compare_digest(password, decrypt(stream["publish_password_enc"])):
             return Response(status_code=204)
     return JSONResponse({"detail": "Forbidden"}, status_code=403)
 
@@ -3899,9 +4316,12 @@ async def media_proxy(media_path: str, request: Request) -> Response:
         raise HTTPException(status_code=403, detail="This monitor belongs to another stream")
     if not (media_path == stream["slug"] or media_path.startswith(stream["slug"] + "/")):
         raise HTTPException(status_code=403, detail="This monitor belongs to another stream")
-    if media_path == stream["slug"]:
+    if media_path in (stream["slug"], program_path(stream["slug"])):
+        # MediaMTX would redirect a bare path name itself, but relative to its
+        # own root, which would leave the player resolving index.m3u8 against
+        # the wrong path.
         query = f"?{request.url.query}" if request.url.query else ""
-        return RedirectResponse(url=f"/media/{stream['slug']}/{query}", status_code=307)
+        return RedirectResponse(url=f"/media/{media_path}/{query}", status_code=307)
     basic = base64.b64encode(f"{MEDIA_INTERNAL_USER}:{MEDIA_INTERNAL_PASS}".encode()).decode()
     headers = {"Authorization": f"Basic {basic}"}
     query = f"?{request.url.query}" if request.url.query else ""

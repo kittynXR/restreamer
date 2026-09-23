@@ -333,6 +333,15 @@ class AudioMappingTest(unittest.TestCase):
             positions.append(position)
         self.assertEqual(positions, sorted(positions), f"wrong argument order: {arguments}")
 
+    def test_the_worker_reads_the_program_path_and_maps_against_it(self) -> None:
+        """A screen on air is a screen the forwarders must carry, so they read
+        the program path, and the layout they map against is that path's --
+        the file's two tracks whenever a screen plays."""
+        flattened = " ".join(inspect.getsource(main.WorkerManager._run).split())
+        self.assertIn('internal_rtsp_url(program_path(row["slug"]))', flattened)
+        self.assertIn('media = await program_status(row["slug"])', flattened)
+        self.assertNotIn('media_status(row["slug"])', flattened)
+
     def test_the_signature_is_platform_layout_and_an_override_that_defaults_on(self) -> None:
         signature = inspect.signature(main.build_audio_args)
         self.assertEqual(
@@ -1586,6 +1595,333 @@ class StallProbeTest(unittest.TestCase):
         self.assertLess(
             main.ULTRA_FAILOVER_STALL_SECONDS, main.FAST_FAILOVER_STALL_SECONDS
         )
+
+
+SWITCH_SLUG = "studio"
+INGEST_LIVE = {"known": True, "available": True, "online": True, "tracks": ["H264", "MPEG-4 Audio", "MPEG-4 Audio"]}
+INGEST_GONE = {"known": True, "available": True, "online": False, "tracks": []}
+PROGRAM_READY = {"known": True, "available": True, "online": False, "tracks": ["H264", "MPEG-4 Audio", "MPEG-4 Audio"]}
+UNREACHABLE = {"known": False, "available": False, "online": False, "tracks": []}
+
+
+def audio_tracks(count: int) -> list[dict]:
+    return [{"codec": "H264", "codecProps": {"width": 1920, "height": 1080}}] + [
+        {"codec": "MPEG-4 Audio", "codecProps": {"sampleRate": 48000, "channelCount": 2}}
+        for _ in range(count)
+    ]
+
+
+class FakeCopy:
+    """Just enough of an asyncio subprocess to stand in for the program copy.
+
+    `hold` keeps it alive until terminate()/kill(), like a copy that is
+    forwarding; otherwise it is a copy that fell over at once.
+    """
+
+    def __init__(self, stderr_lines: tuple[str, ...] = (), hold: bool = False) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        for line in stderr_lines:
+            self.stderr.feed_data(f"{line}\n".encode())
+        self.stderr.feed_eof()
+        self.returncode: int | None = None
+        self.terminated = False
+        self._done = asyncio.Event()
+        if not hold:
+            self.returncode = 1
+            self._done.set()
+
+    async def wait(self) -> int | None:
+        await self._done.wait()
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = 0
+        self._done.set()
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self._done.set()
+
+
+class ProgramSwitchTest(unittest.IsolatedAsyncioTestCase):
+    """The copy that puts OBS on air, driven through its public verbs.
+
+    No ffmpeg, no MediaMTX: the subprocess is a stand-in and the two path
+    views are canned. What is checked is when the copy runs, when it does not,
+    and what the dashboard is told.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.manager = main.ProgramSwitch()
+        self.spawned: list[FakeCopy] = []
+        self.commands: list[tuple[str, ...]] = []
+        self.next_copy = lambda: FakeCopy(hold=True)
+        self.ingest = dict(INGEST_LIVE)
+        self.program = dict(PROGRAM_READY)
+
+        async def spawn(*command: str, stdout: object = None, stderr: object = None) -> FakeCopy:
+            self.commands.append(command)
+            copy = self.next_copy()
+            self.spawned.append(copy)
+            return copy
+
+        async def ingest_status(slug: str) -> dict:
+            return dict(self.ingest)
+
+        async def program_status(slug: str) -> dict:
+            return dict(self.program)
+
+        for patcher in (
+            mock.patch.object(main.asyncio, "create_subprocess_exec", spawn),
+            mock.patch.object(main, "media_status", ingest_status),
+            mock.patch.object(main, "program_status", program_status),
+            mock.patch.object(main.signal_metrics, "stalled_for", lambda slug: None),
+            mock.patch.object(main.random, "uniform", lambda low, high: 1.0),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(self.manager.forget, SWITCH_SLUG)
+
+    def begin(self, desired: bool) -> None:
+        # Seeding desired here keeps ensure() away from the database.
+        self.manager.desired[SWITCH_SLUG] = desired
+        self.manager.ensure(SWITCH_SLUG)
+
+    async def settle(self, seconds: float = 0.05) -> None:
+        await asyncio.sleep(seconds)
+
+    async def test_a_screen_on_air_means_no_copy_even_with_obs_publishing(self) -> None:
+        self.begin(desired=False)
+        await self.settle()
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.manager.snapshot(SWITCH_SLUG)["state"], "stopped")
+
+    async def test_returning_to_live_starts_the_copy_at_once(self) -> None:
+        self.begin(desired=False)
+        await self.settle()
+        self.manager.wake(SWITCH_SLUG)
+        await self.settle()
+        self.assertEqual(len(self.spawned), 1)
+        self.assertEqual(self.manager.snapshot(SWITCH_SLUG)["state"], "running")
+
+    async def test_live_input_with_obs_absent_waits_rather_than_spawning(self) -> None:
+        self.ingest = dict(INGEST_GONE)
+        self.begin(desired=True)
+        await self.settle()
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.manager.snapshot(SWITCH_SLUG)["state"], "waiting")
+
+    async def test_an_unreachable_media_server_holds(self) -> None:
+        """Invariant 9: a tick with no reading is not a reading."""
+        self.ingest = dict(UNREACHABLE)
+        self.begin(desired=True)
+        await self.settle()
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.manager.snapshot(SWITCH_SLUG)["state"], "waiting")
+
+    async def test_a_takeover_ends_the_copy_before_returning(self) -> None:
+        self.begin(desired=True)
+        await self.settle()
+        self.assertEqual(len(self.spawned), 1)
+        await self.manager.stop(SWITCH_SLUG)
+        self.assertTrue(self.spawned[0].terminated)
+        self.assertIsNotNone(self.spawned[0].returncode)
+        self.assertNotIn(SWITCH_SLUG, self.manager.processes)
+        await self.settle()
+        # Not a failure: nothing to retry, no error to show.
+        self.assertEqual(self.manager.snapshot(SWITCH_SLUG)["state"], "stopped")
+        self.assertIsNone(self.manager.snapshot(SWITCH_SLUG)["last_error"])
+        self.assertEqual(len(self.spawned), 1, "the copy came back after a takeover")
+
+    async def test_a_copy_that_dies_backs_off_and_a_wake_cuts_the_wait_short(self) -> None:
+        self.next_copy = lambda: FakeCopy(stderr_lines=("Connection refused",))
+        self.begin(desired=True)
+        await self.settle()
+        self.assertEqual(len(self.spawned), 1)
+        snapshot = self.manager.snapshot(SWITCH_SLUG)
+        self.assertEqual(snapshot["state"], "retrying")
+        self.assertIn("Connection refused", snapshot["last_error"])
+        # The first backoff is a second; nothing else lands inside 50 ms.
+        await self.settle()
+        self.assertEqual(len(self.spawned), 1)
+        self.manager.wake(SWITCH_SLUG)
+        await self.settle()
+        self.assertEqual(len(self.spawned), 2)
+
+    async def test_short_runs_double_the_wait_up_to_the_cap(self) -> None:
+        waits: list[float] = []
+
+        async def pause(wakeup: asyncio.Event, seconds: float) -> None:
+            if self.manager.status.get(SWITCH_SLUG, {}).get("state") == "retrying":
+                waits.append(seconds)
+                if len(waits) >= 8:
+                    self.manager.desired[SWITCH_SLUG] = False
+            await asyncio.sleep(0.001)
+
+        self.next_copy = lambda: FakeCopy()
+        with mock.patch.object(self.manager, "_pause", pause):
+            self.begin(desired=True)
+            for _ in range(200):
+                await asyncio.sleep(0.002)
+                if len(waits) >= 8:
+                    break
+        self.assertEqual(waits, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0])
+
+    async def test_a_layout_mismatch_is_explained_in_the_operators_terms(self) -> None:
+        """MediaMTX refuses a publisher whose tracks differ from the screen's,
+        and ffmpeg only sees the RTSP status line. The two path views are what
+        turn "400 Bad Request" into something a streamer can act on."""
+        self.ingest = {**INGEST_LIVE, "tracks2": audio_tracks(1)}
+        self.program = {**PROGRAM_READY, "tracks2": audio_tracks(2)}
+        self.next_copy = lambda: FakeCopy(stderr_lines=("method RECORD failed: 400 Bad Request",))
+        self.begin(desired=True)
+        await self.settle()
+        error = self.manager.snapshot(SWITCH_SLUG)["last_error"]
+        self.assertIn("OBS is sending 1 audio track", error)
+        self.assertIn("carry 2", error)
+        self.assertIn("Tracks 1 and 2", error)
+
+    async def test_the_internal_credentials_never_reach_the_dashboard(self) -> None:
+        source = main.internal_rtsp_url(SWITCH_SLUG)
+        self.next_copy = lambda: FakeCopy(stderr_lines=(f"{source}: Input/output error",))
+        self.begin(desired=True)
+        await self.settle()
+        error = self.manager.snapshot(SWITCH_SLUG)["last_error"]
+        self.assertIsNotNone(error)
+        self.assertNotIn("internal-password", error)
+        self.assertNotIn("internal:", error)
+
+    async def test_the_copy_is_a_straight_copy_of_every_track(self) -> None:
+        self.begin(desired=True)
+        await self.settle()
+        command = self.commands[0]
+        self.assertEqual(command[0], "ffmpeg")
+        self.assertIn("-map 0 -c copy", " ".join(command))
+        # Once for the RTSP read, once for the RTSP publish.
+        self.assertEqual(command.count("-rtsp_transport"), 2)
+        self.assertNotIn("aac", " ".join(command))
+        self.assertNotIn("libx264", " ".join(command))
+        self.assertTrue(command[-1].endswith("/studio/program"))
+        self.assertIn("/studio", command[command.index("-i") + 1])
+        self.assertNotIn("/program", command[command.index("-i") + 1])
+
+
+class FakeResponse:
+    def __init__(self, status_code: int, payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def json(self) -> dict:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class FakeMediaMTX:
+    """The three config calls _ensure_path makes, against an in-memory table."""
+
+    def __init__(self, configs: dict[str, dict]) -> None:
+        self.configs = configs
+        self.calls: list[tuple[str, str]] = []
+
+    @staticmethod
+    def _name(url: str) -> str:
+        return url.split("/v3/config/paths/", 1)[1].split("/", 1)[1]
+
+    async def get(self, url: str) -> FakeResponse:
+        name = self._name(url)
+        self.calls.append(("get", name))
+        if name not in self.configs:
+            return FakeResponse(404)
+        return FakeResponse(200, self.configs[name])
+
+    async def post(self, url: str, json: dict) -> FakeResponse:
+        name = self._name(url)
+        self.calls.append(("add", name))
+        self.configs[name] = dict(json)
+        return FakeResponse(200)
+
+    async def patch(self, url: str, json: dict) -> FakeResponse:
+        name = self._name(url)
+        self.calls.append(("patch", name))
+        self.configs[name].update(json)
+        return FakeResponse(200)
+
+
+class StreamPathsTest(unittest.IsolatedAsyncioTestCase):
+    """Both of a stream's MediaMTX paths, created and corrected together."""
+
+    async def test_a_new_stream_gets_an_ingest_and_a_program_path(self) -> None:
+        server = FakeMediaMTX({})
+        await main._ensure_stream_paths(server, "studio", seeded=True)
+        self.assertEqual(
+            server.configs["studio"],
+            {"source": "publisher", "overridePublisher": True, "alwaysAvailable": False, "alwaysAvailableFile": ""},
+        )
+        self.assertEqual(server.configs["studio/program"]["alwaysAvailable"], True)
+        self.assertTrue(server.configs["studio/program"]["alwaysAvailableFile"].endswith("/studio/active.mp4"))
+        # The slash in the program name travels as itself.
+        self.assertIn(("add", "studio/program"), server.calls)
+
+    async def test_a_path_from_before_the_split_loses_its_fallback(self) -> None:
+        """Left in place, the ingest's always-available file would play the
+        screen to the copy while OBS is away, and the copy would never see
+        OBS leave."""
+        server = FakeMediaMTX({
+            "studio": {
+                "source": "publisher",
+                "overridePublisher": True,
+                "alwaysAvailable": True,
+                "alwaysAvailableFile": "/relay-data/media/studio/active.mp4",
+            }
+        })
+        await main._ensure_stream_paths(server, "studio", seeded=True)
+        self.assertIn(("patch", "studio"), server.calls)
+        self.assertFalse(server.configs["studio"]["alwaysAvailable"])
+        self.assertEqual(server.configs["studio"]["alwaysAvailableFile"], "")
+        self.assertIn(("add", "studio/program"), server.calls)
+
+    async def test_an_unseeded_stream_still_gets_both_paths(self) -> None:
+        server = FakeMediaMTX({})
+        await main._ensure_stream_paths(server, "studio", seeded=False)
+        self.assertIn("studio", server.configs)
+        self.assertNotIn("alwaysAvailable", server.configs["studio/program"])
+
+    async def test_nothing_is_patched_when_both_already_match(self) -> None:
+        server = FakeMediaMTX({})
+        await main._ensure_stream_paths(server, "studio", seeded=True)
+        server.calls.clear()
+        await main._ensure_stream_paths(server, "studio", seeded=True)
+        self.assertEqual([call for call in server.calls if call[0] != "get"], [])
+
+
+class ReaderCountTest(unittest.IsolatedAsyncioTestCase):
+    """"Forwarders reading" counts the program path's readers and nothing else."""
+
+    async def test_the_copys_publish_session_is_not_a_forwarder(self) -> None:
+        metrics = main.SignalMetrics()
+        listings = {
+            "/v3/paths/list": [{"name": "studio"}, {"name": "studio/program"}],
+            "/v3/srtconns/list": [],
+            "/v3/rtspsessions/list": [
+                {"path": "studio/program", "state": "publish"},
+                {"path": "studio/program", "state": "read"},
+                {"path": "studio/program", "state": "read"},
+                {"path": "studio", "state": "read"},
+            ],
+        }
+
+        async def items(client: object, endpoint: str) -> list[dict]:
+            return listings[endpoint]
+
+        with mock.patch.object(main.SignalMetrics, "_items", staticmethod(items)):
+            await metrics.sample()
+        self.assertEqual(metrics.snapshot("studio")["reader_count"], 2)
 
 
 if __name__ == "__main__":

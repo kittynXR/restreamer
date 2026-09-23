@@ -107,12 +107,16 @@ That keeps the rest of the stream up instead of failing every destination.
 
 ### Extra tracks
 
-OBS can publish up to six audio tracks. Relay carries every track that arrives,
-but only Tracks 1 and 2 are ever sent to a destination, so extra tracks enabled
-for a local recording are harmless.
+Send exactly two audio tracks to Relay — Tracks 1 and 2 in the streaming
+output. Relay's screens carry two tracks, and the media server only puts OBS on
+air when OBS's layout matches them: a third track, or a single track, leaves OBS
+connected but off air, and the dashboard says so. Extra tracks for a local
+recording are fine as long as they are not enabled for the stream.
 
 Use the authenticated browser monitor to switch between detected input audio tracks when testing. Verify with a private/unlisted destination before a production broadcast.
 
 ## Connection behavior
 
-If OBS disconnects while Relay is in Live Input mode, the active BRB file keeps enabled destinations alive. OBS may reconnect automatically. Manual BRB or Starting Soon takeover intentionally rejects OBS until **Return to live input** is selected.
+If OBS disconnects while Relay is in Live Input mode, the active BRB file keeps enabled destinations alive. OBS may reconnect automatically.
+
+OBS can connect at any time, including while BRB or Starting Soon is on air. It then stays connected and off air — viewers keep seeing the screen — until **Return to live input** is selected, which puts OBS on air within a couple of seconds. Turning a screen on while live does not disconnect OBS either. The dashboard monitor shows what viewers see; **Preview OBS** shows what OBS is sending while a screen is up.

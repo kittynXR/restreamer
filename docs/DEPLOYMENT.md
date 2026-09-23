@@ -51,7 +51,7 @@ The integration requests `channel:read:ads` and `channel:edit:commercial`. Users
 1. Open the HTTPS dashboard and create the owner with the bootstrap token.
 2. Upload a BRB video. Relay converts it to the failover format and makes it the default for future invited users.
 3. Optionally upload Starting Soon.
-4. Open Quick start, copy the generated SRT URL, and configure OBS.
+4. Open Quick start, copy the generated SRT URL, and configure OBS with exactly two audio tracks (Tracks 1 and 2) in the streaming output.
 5. Add destination keys, leave every destination off, and test them one at a time.
 6. Connect Twitch and arm outage ads only if the streamer wants automatic commercials.
 

@@ -9,7 +9,7 @@ import time
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 TEST_ROOT = Path(tempfile.mkdtemp(prefix="relay-team-tests-"))
 os.environ["DB_PATH"] = str(TEST_ROOT / "relay.db")
@@ -541,6 +541,14 @@ class TeamInvitationFlowTest(unittest.TestCase):
         main.ensure_fallback_path = AsyncMock(return_value=True)
         main.kick_stream_publishers = AsyncMock()
         main.remove_fallback_path = AsyncMock()
+        # The ingest->program copy is a subprocess supervisor; its verbs are
+        # what the routes are checked against, never a real ffmpeg.
+        main.program_switch.start = AsyncMock()
+        main.program_switch.shutdown = AsyncMock()
+        main.program_switch.stop = AsyncMock()
+        main.program_switch.wake = Mock()
+        main.program_switch.ensure = Mock()
+        main.program_switch.forget = Mock()
         cls.client_context = TestClient(main.app, base_url="https://testserver")
         cls.client = cls.client_context.__enter__()
 
@@ -594,6 +602,8 @@ class TeamInvitationFlowTest(unittest.TestCase):
             return_value={"available": True, "online": True, "tracks": ["H264"]}
         )
         main.kick_stream_publishers.reset_mock()
+        main.program_switch.stop.reset_mock()
+        main.program_switch.wake.reset_mock()
         brb_takeover = self.client.patch(
             "/api/screens/mode",
             headers={"X-CSRF-Token": owner_csrf},
@@ -601,7 +611,10 @@ class TeamInvitationFlowTest(unittest.TestCase):
         )
         self.assertEqual(brb_takeover.status_code, 200, brb_takeover.text)
         self.assertEqual(main.current_program_mode(owner_stream["id"]), "brb")
-        main.kick_stream_publishers.assert_awaited_once_with("studio")
+        # A takeover takes OBS off air by stopping the ingest->program copy.
+        # OBS's own connection is left alone: it may stand by behind the screen.
+        main.program_switch.stop.assert_awaited_once_with("studio")
+        main.kick_stream_publishers.assert_not_awaited()
 
         publish_auth = {
             "action": "publish",
@@ -609,8 +622,35 @@ class TeamInvitationFlowTest(unittest.TestCase):
             "user": owner_stream["publish_user"],
             "password": main.decrypt(owner_stream["publish_password_enc"]),
         }
+        # ...and it is admitted while the screen is on air. This is the whole
+        # point of the split: connecting OBS during Starting Soon used to be a
+        # 403 that OBS reported as "cannot connect to server".
         self.assertEqual(
             self.client.post("/internal/mediamtx-auth", json=publish_auth).status_code,
+            204,
+        )
+        # Only to the ingest, though. OBS's credentials never open the program
+        # path, and the internal credentials never open OBS's.
+        internal = {"user": "internal", "password": "internal-password"}
+        self.assertEqual(
+            self.client.post(
+                "/internal/mediamtx-auth",
+                json={**publish_auth, "path": "studio/program"},
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/internal/mediamtx-auth",
+                json={"action": "publish", "path": "studio/program", **internal},
+            ).status_code,
+            204,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/internal/mediamtx-auth",
+                json={"action": "publish", "path": "studio", **internal},
+            ).status_code,
             403,
         )
         starting_takeover = self.client.patch(
@@ -620,6 +660,7 @@ class TeamInvitationFlowTest(unittest.TestCase):
         )
         self.assertEqual(starting_takeover.status_code, 200, starting_takeover.text)
         self.assertEqual(main.current_program_mode(owner_stream["id"]), "starting_soon")
+        main.program_switch.wake.assert_not_called()
         return_live = self.client.patch(
             "/api/screens/mode",
             headers={"X-CSRF-Token": owner_csrf},
@@ -627,10 +668,17 @@ class TeamInvitationFlowTest(unittest.TestCase):
         )
         self.assertEqual(return_live.status_code, 200, return_live.text)
         self.assertEqual(main.current_program_mode(owner_stream["id"]), "live")
+        # Returning to live puts OBS on air by waking the copy, not by
+        # reopening a gate.
+        main.program_switch.wake.assert_called_once_with("studio")
         self.assertEqual(
             self.client.post("/internal/mediamtx-auth", json=publish_auth).status_code,
             204,
         )
+        state = self.client.get("/api/state").json()
+        # The dashboard gets both views: OBS's connection and what is on air.
+        self.assertIn("online", state["stream"]["program"])
+        self.assertIn("state", state["stream"]["program"]["switch"])
         self.assertEqual(
             self.client.get("/api/state").json()["screens"]["program_mode"],
             "live",
@@ -942,6 +990,9 @@ class TeamInvitationFlowTest(unittest.TestCase):
             ).status_code,
             409,
         )
+        main.program_switch.stop.reset_mock()
+        main.kick_stream_publishers.reset_mock()
+        main.remove_fallback_path.reset_mock()
         suspended = self.client.patch(
             f"/api/team/users/{partner['id']}",
             headers={"X-CSRF-Token": owner_csrf},
@@ -949,6 +1000,12 @@ class TeamInvitationFlowTest(unittest.TestCase):
         )
         self.assertEqual(suspended.status_code, 200, suspended.text)
         self.assertEqual(suspended.json()["status"], "suspended")
+        # Suspension is the one case that still disconnects OBS outright, and
+        # it also takes the copy and both paths down with it.
+        main.program_switch.stop.assert_awaited_once_with(partner["slug"])
+        main.program_switch.forget.assert_called_with(partner["slug"])
+        main.kick_stream_publishers.assert_awaited_once_with(partner["slug"])
+        main.remove_fallback_path.assert_awaited_once_with(partner["slug"])
 
         self.client.post("/api/logout", headers={"X-CSRF-Token": owner_csrf})
         self.assertEqual(
@@ -1057,6 +1114,17 @@ class TeamInvitationFlowTest(unittest.TestCase):
         self.assertEqual(
             self.client.get(f"/media/{partner['slug']}/../studio/index.m3u8").status_code,
             403,
+        )
+        # The program path lives under the same prefix, so the same rule holds
+        # there, and the bare program name redirects to its own directory
+        # rather than letting MediaMTX send the player up to the ingest.
+        self.assertEqual(self.client.get("/media/studio/program/index.m3u8").status_code, 403)
+        program_redirect = self.client.get(
+            f"/media/{partner['slug']}/program?muted=false", follow_redirects=False
+        )
+        self.assertEqual(program_redirect.status_code, 307)
+        self.assertEqual(
+            program_redirect.headers["location"], f"/media/{partner['slug']}/program/?muted=false"
         )
 
         # A publish must be refused when the credentials belong to another path.

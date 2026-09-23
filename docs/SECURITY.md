@@ -15,7 +15,7 @@ Only HTTPS and the SRT UDP port should be public. Keep the MediaMTX API, RTSP, H
 - Argon2 hashes account passwords.
 - Session cookies are signed, HTTPS-only in production, and SameSite Lax.
 - Mutating routes require CSRF tokens.
-- MediaMTX delegates publish/read authorization to the router.
+- MediaMTX delegates publish/read authorization to the router. The internal media credentials may read any path but publish only to a `*/program` path; a stream's own credentials publish only to its bare slug.
 - User-owned queries are scoped by the signed-in user and stream ID.
 - Recoverable secrets are encrypted before SQLite persistence.
 - Destination errors redact output URLs before persistence.

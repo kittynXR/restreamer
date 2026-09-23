@@ -52,11 +52,15 @@ Each worker also reports `-progress` on stdout. A destination is only marked `fo
 
 ## Program source states
 
-- `live`: OBS is allowed to publish.
-- `brb`: Relay activates the BRB file and rejects/kicks the OBS publisher.
-- `starting_soon`: Relay activates the Starting Soon file and rejects/kicks the OBS publisher.
+Each stream has two MediaMTX paths. OBS publishes to the ingest path (`<slug>`), and it is admitted whatever is on air. Destinations and the monitor read the program path (`<slug>/program`), whose always-available file is `active.mp4`. The router's `ProgramSwitch` runs one `-c copy` FFmpeg per stream that reads the ingest over RTSP and publishes it to the program path, only while program mode is `live` and OBS is publishing.
 
-Connection-loss failover is separate from manual takeover: while program mode is `live`, MediaMTX’s always-available file takes over when the SRT publisher disappears and yields when OBS reconnects.
+- `live`: the copy runs, so OBS is on air as soon as it publishes.
+- `brb`: Relay copies the BRB file over `active.mp4` and stops the copy; the program path drops to the file, the forwarders stay attached, and OBS stays connected, standing by.
+- `starting_soon`: the same with the Starting Soon file.
+
+Returning to live restarts the copy, which MediaMTX splices in on a keyframe. Connection-loss failover is separate from manual takeover: while program mode is `live`, OBS disappearing closes the ingest path and with it the copy's input, so the copy exits and the program path's always-available file takes over; the copy returns when OBS does. Only suspending a user disconnects OBS outright.
+
+MediaMTX only admits a publisher onto an always-available path whose track layout matches the file's. Every screen carries two AAC tracks, so OBS must send exactly tracks 1 and 2; otherwise the copy's RTSP publish is refused while OBS itself looks connected, and the router reports the mismatch on the dashboard.
 
 ### Handoff latency
 
@@ -73,3 +77,4 @@ The screen encoder (`slate_encode_args`) reproduces the bitstream parameters of 
 - HTTPS is public through Caddy.
 - MediaMTX API, RTSP, HLS origin, router, and SQLite remain on internal Docker networks or loopback.
 - The dashboard monitor is authenticated by the router before MediaMTX HLS is fetched with internal credentials.
+- The internal media credentials may read any path but publish only to `*/program`; OBS's per-stream credentials publish only to that stream's bare slug.

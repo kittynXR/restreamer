@@ -28,6 +28,8 @@ docker compose build router
 docker compose up -d --no-deps router
 ```
 
+A router restart also stops every stream's ingest→program copy, so the backup screen is on air for the restart window and OBS returns on the next keyframe once the router is back; OBS itself stays connected.
+
 MediaMTX changes interrupt ingest and monitoring. Schedule them while nobody is live:
 
 ```bash
@@ -62,7 +64,8 @@ Keep backups outside the public repository. Test restores on a separate Docker v
 
 ## Common symptoms
 
-- OBS green but monitor blank: inspect MediaMTX path state and HLS requests; confirm the user is signed in and audio/video tracks were detected.
+- OBS green but monitor blank: inspect MediaMTX path state (`<slug>` is OBS, `<slug>/program` is what viewers get) and HLS requests; confirm the user is signed in and audio/video tracks were detected.
+- OBS connected but the backup screen stays on air with Live input selected: the dashboard notice names the cause. Almost always a track-layout mismatch — OBS is sending one or three audio tracks and the screens carry two — which the media server refuses at the program path. Fix the OBS output; nothing on the server needs restarting.
 - Forwarder repeatedly reconnects: inspect the destination’s redacted last error and router logs; verify the platform key is current.
 - BRB unavailable for a new user: upload a ready BRB for the owner first so `_default/brb.mp4` can seed invited users.
 - Twitch outage ads unavailable: verify OAuth configuration, reconnect Twitch, and confirm both required scopes were granted.

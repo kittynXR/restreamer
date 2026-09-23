@@ -68,7 +68,13 @@ type StreamState = {
   stream: {
     slug: string;
     obs_url: string;
+    // `media` is OBS's own connection to the relay (the ingest path). `program`
+    // is what actually reaches the destinations: OBS by way of the router's
+    // copy, or the screen on air while that copy is stopped. The two can
+    // disagree on purpose — OBS connected and standing by behind Starting Soon
+    // is the whole point of keeping them apart.
     media: { known?: boolean; available: boolean; online: boolean; tracks: string[]; tracks2?: MediaTrack[]; bytes_received?: number };
+    program: { known?: boolean; available: boolean; online: boolean; tracks: string[]; switch: { state: "stopped" | "waiting" | "running" | "retrying"; last_error?: string | null; since_s?: number | null } };
     signal: SignalMetrics;
     fast_failover: boolean;
     fast_failover_seconds: number;
@@ -346,7 +352,7 @@ function ContributionPanel({ signal, media, programMode, stalls }: { signal: Sig
       </dl>
       <p className="metric-caption">
         {signal.track_summary.length ? signal.track_summary.join(" · ")
-          : programMode !== "live" ? "A manual screen is on air; OBS is held off."
+          : programMode !== "live" ? "A manual screen is on air. OBS can connect and stand by behind it."
           : signal.known ? "Waiting for track information from OBS."
           : "Relay cannot reach the media server right now."}
       </p>
@@ -614,6 +620,9 @@ export default function Home() {
   const [showOnboardingOffer, setShowOnboardingOffer] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showMonitor, setShowMonitor] = useState(false);
+  // The monitor shows what viewers get by default; "Preview OBS" looks at the
+  // ingest instead, which is how a stream is checked behind Starting Soon.
+  const [monitorSource, setMonitorSource] = useState<"program" | "obs">("program");
   const [showAdd, setShowAdd] = useState(false);
   const [copied, setCopied] = useState(false);
   const [pendingToggle, setPendingToggle] = useState<Destination | null>(null);
@@ -758,6 +767,12 @@ export default function Home() {
   const programMode = state.screens.program_mode;
   const programLabel = programMode === "starting_soon" ? "Starting Soon" : programMode === "brb" ? "BRB" : "Live input";
   const manualScreen = programMode !== "live";
+  // OBS is on air only once the router's copy is publishing to the program
+  // path; between "Return to live input" and that moment the screen still plays.
+  const programOnline = state.stream.program.online;
+  // The copy died and the router can say why: the one program-path state that
+  // needs the operator, because OBS looks connected while nothing reaches air.
+  const switchError = state.stream.program.switch.state === "retrying" ? state.stream.program.switch.last_error : null;
   // "Armed" was a hard-coded literal; drive it from whether a screen is actually
   // ready to take over.
   const protectionArmed = state.screens.brb.status === "ready";
@@ -914,17 +929,17 @@ export default function Home() {
       </aside>
 
       <section className="content" id="overview">
-        <header className="topbar"><div><p className="eyebrow">YOUR STREAM</p><h1>Broadcast control</h1></div><div className={`signal ${isLive && !manualScreen ? "" : "fallback"}`}><span />{manualScreen ? `${programLabel} on air` : isLive ? "Signal connected" : isAvailable ? "Backup screen active" : "Waiting for OBS"}</div></header>
+        <header className="topbar"><div><p className="eyebrow">YOUR STREAM</p><h1>Broadcast control</h1></div><div className={`signal ${programOnline && !manualScreen ? "" : "fallback"}`}><span />{manualScreen ? `${programLabel} on air · ${isLive ? "OBS standing by" : "waiting for OBS"}` : programOnline ? "Signal connected" : isLive ? "Putting OBS on air…" : isAvailable ? "Backup screen active" : "Waiting for OBS"}</div></header>
         {error && <div className="notice error-notice">{error}<button onClick={() => setError("")}>Dismiss</button></div>}
         {Boolean(staleSince) && <div className="notice stale-notice" role="status">Reconnecting to Relay — these readings may be out of date.</div>}
-        {manualScreen && isLive && <div className="notice error-notice" role="alert">A manual screen is on air but OBS is still publishing. Destinations may be carrying your live camera.</div>}
+        {switchError && <div className="notice error-notice" role="alert">OBS is connected but Relay cannot put it on air: {switchError}</div>}
         <TrackTwoAlert destinations={state.destinations} arriving={arrivingTracks} />
 
         <section className="hero-grid">
           <article className="preview-card">
-            {showMonitor && isAvailable ? <iframe title="Live monitor" src={`/media/${state.stream.slug}?muted=false`} allow="autoplay; fullscreen" /> :
-              <div className={`preview ${isLive && !manualScreen ? "" : "offline"}`}><div className="preview-copy"><span className={isLive && !manualScreen ? "live-pill" : "backup-pill"}>{manualScreen ? programLabel.toUpperCase() : isLive ? "LIVE INPUT" : "PROTECTED"}</span><strong>{manualScreen ? `${programLabel} is on air` : isLive ? "OBS connected" : "Backup screen ready"}</strong><small>{manualScreen ? "OBS reconnect is paused by Relay" : state.stream.media.tracks.length ? `${state.stream.media.tracks.length} media tracks detected` : "Waiting for track information"}</small></div><div className="audio-bars" aria-hidden="true">{Array.from({ length: 16 }).map((_, index) => <i key={index} />)}</div></div>}
-            <footer><div><span className={`status-dot ${isLive && !manualScreen ? "" : "amber"}`} /><strong>{manualScreen ? `${programLabel} is feeding destinations` : isLive ? "OBS is sending" : "Connection protection is active"}</strong></div><button type="button" onClick={() => setShowMonitor((value) => !value)}>{showMonitor ? "Close monitor" : "Open monitor"}</button></footer>
+            {showMonitor && isAvailable ? <iframe title={monitorSource === "obs" ? "OBS preview" : "Program monitor"} src={monitorSource === "obs" && isLive ? `/media/${state.stream.slug}/?muted=false` : `/media/${state.stream.slug}/program/?muted=false`} allow="autoplay; fullscreen" /> :
+              <div className={`preview ${programOnline && !manualScreen ? "" : "offline"}`}><div className="preview-copy"><span className={programOnline && !manualScreen ? "live-pill" : "backup-pill"}>{manualScreen ? programLabel.toUpperCase() : programOnline ? "LIVE INPUT" : "PROTECTED"}</span><strong>{manualScreen ? `${programLabel} is on air` : programOnline ? "OBS on air" : isLive ? "OBS connected" : "Backup screen ready"}</strong><small>{manualScreen ? (isLive ? "OBS is connected and standing by" : "OBS can connect at any time") : state.stream.media.tracks.length ? `${state.stream.media.tracks.length} media tracks detected` : "Waiting for track information"}</small></div><div className="audio-bars" aria-hidden="true">{Array.from({ length: 16 }).map((_, index) => <i key={index} />)}</div></div>}
+            <footer><div><span className={`status-dot ${programOnline && !manualScreen ? "" : "amber"}`} /><strong>{manualScreen ? `${programLabel} is feeding destinations` : programOnline ? "OBS is on air" : isLive ? "Putting OBS on air" : "Connection protection is active"}</strong></div><div className="monitor-actions">{showMonitor && isLive && <button type="button" onClick={() => setMonitorSource((value) => value === "obs" ? "program" : "obs")}>{monitorSource === "obs" ? "Show program" : "Preview OBS"}</button>}<button type="button" onClick={() => setShowMonitor((value) => !value)}>{showMonitor ? "Close monitor" : "Open monitor"}</button></div></footer>
           </article>
           <article className="protection-card">
             <div className="protection-icon"><span /></div>
@@ -962,7 +977,7 @@ export default function Home() {
               <ScreenRow kind="brb" title="BRB / connection lost" name="BRB" ready="Default screen ready" missing="Default screen unavailable" asset={state.screens.brb} upload={upload} onAir={programMode === "brb"} switchBusy={protectionBusy} onUpload={uploadScreen} onSwitch={() => setPendingScreenMode(programMode === "brb" ? "live" : "brb")} />
               <ScreenRow kind="starting_soon" title="Starting Soon" name="Starting Soon" ready="Ready" missing="Upload a video to enable" asset={state.screens.starting_soon} upload={upload} onAir={programMode === "starting_soon"} switchBusy={protectionBusy} onUpload={uploadScreen} onSwitch={() => setPendingScreenMode(programMode === "starting_soon" ? "live" : "starting_soon")} />
             </div>
-            <div className="screen-actions">{programMode !== "live" && <button className="primary" disabled={protectionBusy} onClick={() => setPendingScreenMode("live")}>Return to live input</button>}<span>{programMode === "live" ? "Both screen switches are off. OBS is the program source." : "Relay will allow OBS to reconnect when you return to live input."}</span></div>
+            <div className="screen-actions">{programMode !== "live" && <button className="primary" disabled={protectionBusy} onClick={() => setPendingScreenMode("live")}>Return to live input</button>}<span>{programMode === "live" ? "Both screen switches are off. OBS is the program source." : isLive ? "OBS is connected and standing by. Return to live input to put it on air." : "OBS can connect and stand by behind this screen. Return to live input to put it on air."}</span></div>
           </article>
           <article className="control-card twitch-control">
             <div className="control-card-head"><div><p className="eyebrow">TWITCH FAILOVER</p><h2>Automatic outage ad</h2></div><span className={"status-chip " + (state.twitch.failover_ads_enabled ? "armed" : "disabled")}>{state.twitch.failover_ads_enabled ? "Armed" : "Disabled"}</span></div>
@@ -1041,7 +1056,7 @@ export default function Home() {
         </div>}
         <div className="modal-actions"><button type="button" className="secondary" disabled={toggleBusy} onClick={() => setPendingToggle(null)}>Cancel</button><button type="button" className={pendingToggle.enabled ? "danger" : "primary"} disabled={toggleBusy || Boolean(fallbackBusy)} onClick={confirmToggle}>{toggleBusy ? "Working…" : pendingToggle.enabled ? "Stop forwarding" : "Start forwarding"}</button></div>
       </Modal>}
-      {pendingScreenMode && <Modal title={pendingScreenMode === "live" ? "Return to live input?" : pendingScreenMode === "brb" ? "Put BRB on air?" : "Put Starting Soon on air?"} onClose={() => { if (!protectionBusy) setPendingScreenMode(null); }}><p className="modal-copy">{pendingScreenMode === "live" ? "Relay will allow OBS to reconnect. The BRB screen stays on air until the OBS signal arrives." : programMode === "live" ? "Relay will temporarily disconnect and hold OBS so this screen can feed every enabled destination. Automatic outage ads will not run during a manual screen." : "Relay will switch the current program screen while keeping enabled destinations connected."}</p><div className="confirm-destination screen-confirm"><div className="screen-confirm-icon">{pendingScreenMode === "live" ? "●" : pendingScreenMode === "brb" ? "B" : "S"}</div><div><strong>{pendingScreenMode === "live" ? "Live OBS input" : pendingScreenMode === "brb" ? "BRB / connection lost" : "Starting Soon"}</strong><span>{pendingScreenMode === "live" ? "OBS reconnect permitted" : "Manual program takeover"}</span></div></div><div className="modal-actions"><button type="button" className="secondary" disabled={protectionBusy} onClick={() => setPendingScreenMode(null)}>Cancel</button><button type="button" className="primary" disabled={protectionBusy} onClick={() => changeScreenMode(pendingScreenMode)}>{protectionBusy ? "Switching…" : pendingScreenMode === "live" ? "Return to live input" : "Put screen on air"}</button></div></Modal>}
+      {pendingScreenMode && <Modal title={pendingScreenMode === "live" ? "Return to live input?" : pendingScreenMode === "brb" ? "Put BRB on air?" : "Put Starting Soon on air?"} onClose={() => { if (!protectionBusy) setPendingScreenMode(null); }}><p className="modal-copy">{pendingScreenMode === "live" ? (isLive ? "OBS is connected, so it goes on air right away." : "The current screen stays on air until OBS connects, then OBS takes over.") : programMode === "live" ? "This screen feeds every enabled destination. OBS stays connected and stands by, off air, until you return to live input. Automatic outage ads will not run during a manual screen." : "Relay will switch the current program screen while keeping enabled destinations connected."}</p><div className="confirm-destination screen-confirm"><div className="screen-confirm-icon">{pendingScreenMode === "live" ? "●" : pendingScreenMode === "brb" ? "B" : "S"}</div><div><strong>{pendingScreenMode === "live" ? "Live OBS input" : pendingScreenMode === "brb" ? "BRB / connection lost" : "Starting Soon"}</strong><span>{pendingScreenMode === "live" ? "OBS goes on air" : "OBS stays connected, off air"}</span></div></div><div className="modal-actions"><button type="button" className="secondary" disabled={protectionBusy} onClick={() => setPendingScreenMode(null)}>Cancel</button><button type="button" className="primary" disabled={protectionBusy} onClick={() => changeScreenMode(pendingScreenMode)}>{protectionBusy ? "Switching…" : pendingScreenMode === "live" ? "Return to live input" : "Put screen on air"}</button></div></Modal>}
       {pendingRemove && <Modal title={`Remove ${pendingRemove.name}?`} onClose={() => { if (!toggleBusy) setPendingRemove(null); }}>
         <p className="modal-copy">Relay stops forwarding to {pendingRemove.name} and forgets its stream key. You can add it again with a new key at any time.</p>
         <div className="confirm-destination"><PlatformIcon platform={pendingRemove.platform} fallback={pendingRemove.name[0]?.toUpperCase()} /><div><strong>{pendingRemove.name}</strong><span>{effectiveAudio(pendingRemove, arrivingTracks).label}</span></div></div>
@@ -1091,7 +1106,7 @@ function OnboardingTour({ state, onClose, onFinish }: { state:StreamState; onClo
       <p className="eyebrow">STAY ON AIR</p>
       <h3>Let Relay protect the broadcast</h3>
       <div className="tour-feature"><span>1</span><div><strong>BRB fallback</strong><p>If OBS drops, Relay keeps enabled destinations alive with your BRB video.</p></div></div>
-      <div className="tour-feature"><span>2</span><div><strong>Manual screens</strong><p>Use Starting Soon or BRB as the program source, then choose Return to live input.</p></div></div>
+      <div className="tour-feature"><span>2</span><div><strong>Manual screens</strong><p>Put Starting Soon or BRB on air while OBS connects and stands by, then choose Return to live input.</p></div></div>
       <div className="tour-feature"><span>3</span><div><strong>Optional Twitch protection</strong><p>Connect Twitch and arm automatic outage ads only when you want that behavior.</p></div></div>
       <p className="tour-note">You can reopen this walkthrough anytime from <strong>Quick start</strong> in the sidebar.</p>
     </div>}
