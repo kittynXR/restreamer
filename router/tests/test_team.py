@@ -338,6 +338,178 @@ class FailoverPrestageRaceTest(unittest.TestCase):
         self.assertEqual(active, b"fresh-slate-variant")
 
 
+class FreshVolumeSlateTest(unittest.TestCase):
+    """The first boot on an empty `relay_data` volume must render a slate.
+
+    `generate_placeholder_slate` has ffmpeg write its pending file straight into
+    `media/_default`, and on a brand-new volume nothing else has created that
+    directory. It used to be made only after ffmpeg exited, so the encode failed
+    with "Error opening output ... No such file or directory", no slate landed,
+    and MediaMTX had no `alwaysAvailableFile` to open. Like the tests above this
+    never starts the app: it points `main.DB_PATH` at a throwaway file and swaps
+    ffmpeg for a stand-in that notes whether its output directory exists yet.
+    """
+
+    def test_first_boot_creates_the_slate_directory_before_ffmpeg_runs(self) -> None:
+        db = TEST_ROOT / "fresh-volume" / "relay.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        original_db_path = main.DB_PATH
+        main.DB_PATH = db
+        try:
+            main.initialize_db()
+            target = main.slate_variant_path(
+                main.snap_slate_variant(dict(main.DEFAULT_CONTRIBUTION))
+            )
+            self.assertFalse(
+                target.parent.exists(), "not a fresh volume: media/_default already exists"
+            )
+            output_dir_ready: list[bool] = []
+
+            class FakeRender:
+                returncode = 0
+
+                async def communicate(self) -> tuple[bytes, bytes]:
+                    return b"", b""
+
+            async def fake_exec(*command: str, stdout: object = None, stderr: object = None) -> FakeRender:
+                output = Path(command[-1])
+                output_dir_ready.append(output.parent.is_dir())
+                output.write_bytes(b"placeholder-slate")
+                return FakeRender()
+
+            with patch.object(main.asyncio, "create_subprocess_exec", fake_exec):
+                asyncio.run(main.ensure_slate_variants())
+            landed = target.exists()
+        finally:
+            main.DB_PATH = original_db_path
+
+        self.assertTrue(output_dir_ready, "no slate render was attempted")
+        self.assertNotIn(
+            False, output_dir_ready, "output directory missing when ffmpeg was spawned"
+        )
+        self.assertTrue(landed, "the rendered slate never reached its variant path")
+
+
+class FakeEncode:
+    """Just enough of an asyncio subprocess to stand in for the screen encode."""
+
+    def __init__(self, stdout: object) -> None:
+        self.stdout = stdout
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_eof()
+        self.returncode: int | None = None
+
+    async def wait(self) -> int:
+        self.returncode = 0
+        return 0
+
+
+class ScreenConversionProgressTest(unittest.TestCase):
+    """What the dashboard is told while an uploaded screen converts.
+
+    Runs the real conversion task end to end, with ffmpeg replaced by a stand-in
+    that writes its output file and plays back -progress blocks. Like the tests
+    above it never starts the app: it points `main.DB_PATH` at a throwaway file
+    and reads `media_assets_state()`, which is what `/api/state` returns under
+    `screens`.
+    """
+
+    def test_the_gauge_tracks_the_encode_and_clears_when_it_lands(self) -> None:
+        db = TEST_ROOT / "conversion-progress" / "relay.db"
+        db.parent.mkdir(parents=True, exist_ok=True)
+        original_db_path = main.DB_PATH
+        main.DB_PATH = db
+        try:
+            main.initialize_db()
+            with main.connect() as conn:
+                conn.execute(
+                    "INSERT INTO users (id, username, display_name, password_hash,"
+                    " role, created_at) VALUES (1, 'kittyn', 'kittyn', 'x',"
+                    " 'owner', ?)",
+                    (main.now(),),
+                )
+                conn.execute(
+                    "INSERT INTO streams (id, user_id, slug, publish_user,"
+                    " publish_password_enc, created_at) VALUES"
+                    " (1, 1, 'studio', 'pub_test', ?, ?)",
+                    (main.encrypt("pw"), main.now()),
+                )
+                stream = conn.execute("SELECT * FROM streams WHERE id = 1").fetchone()
+            source = main.stream_media_dir("studio") / ".brb-test.upload"
+            source.write_bytes(b"uploaded-video")
+
+            manager = main.MediaConversionManager()
+            # A 20 s upload, written by ffmpeg in quarters.
+            manager._probe = AsyncMock(return_value=(20.0, True))
+            positions = [5.0, 10.0, 15.0, 20.0]
+            seen: list[dict | None] = []
+            spawned: list[tuple[tuple[str, ...], object]] = []
+
+            class Stdout:
+                def __init__(self) -> None:
+                    self.lines: list[bytes] = []
+
+                def __aiter__(self) -> "Stdout":
+                    return self
+
+                async def __anext__(self) -> bytes:
+                    if not self.lines:
+                        # What a dashboard poll landing between two blocks reads.
+                        seen.append(main.media_assets_state(stream)["brb"]["progress"])
+                        if not positions:
+                            raise StopAsyncIteration
+                        position = positions.pop(0)
+                        self.lines = [
+                            f"out_time_us={int(position * 1_000_000)}\n".encode(),
+                            b"progress=continue\n",
+                        ]
+                    return self.lines.pop(0)
+
+            async def fake_exec(*command: str, stdout: object = None, stderr: object = None) -> FakeEncode:
+                spawned.append((command, stdout))
+                Path(command[-1]).write_bytes(b"converted-screen")
+                return FakeEncode(Stdout())
+
+            async def upload() -> None:
+                # The upload route's two calls, in its order.
+                manager._set_status(1, "brb", "converting", "clip.mov")
+                manager.start(stream, "brb", source, "clip.mov")
+                await manager.tasks[(1, "brb")]
+
+            with (
+                patch.object(main, "media_conversions", manager),
+                patch.object(main.asyncio, "create_subprocess_exec", fake_exec),
+                patch.object(
+                    main,
+                    "media_status",
+                    AsyncMock(return_value={"known": True, "available": True, "online": False, "tracks": []}),
+                ),
+                patch.object(main, "activate_screen_file", AsyncMock()),
+            ):
+                asyncio.run(upload())
+                landed = main.media_assets_state(stream)["brb"]
+            converted = main.media_asset_path("studio", "brb").read_bytes()
+        finally:
+            main.DB_PATH = original_db_path
+
+        self.assertEqual(len(spawned), 1)
+        command, stdout = spawned[0]
+        # The gauge is fed from ffmpeg's own -progress on a piped stdout; a
+        # DEVNULL there would leave the bar at zero for the whole encode.
+        self.assertIn("-progress pipe:1", " ".join(command))
+        self.assertIs(stdout, asyncio.subprocess.PIPE)
+        self.assertNotIn(None, seen, "a poll during the encode got no gauge")
+        self.assertEqual({entry["stage"] for entry in seen}, {"encoding"})
+        self.assertEqual([entry["fraction"] for entry in seen], [0.0, 0.25, 0.5, 0.75, 1.0])
+        # Landed: the row reads ready, the gauge is gone, and nothing is left
+        # behind to draw a bar on the next poll.
+        self.assertEqual(landed["status"], "ready")
+        self.assertIsNone(landed["progress"])
+        self.assertEqual(manager.progress, {})
+        self.assertEqual(converted, b"converted-screen")
+        self.assertFalse(source.exists(), "the upload was not cleaned up")
+
+
 class TeamInvitationFlowTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

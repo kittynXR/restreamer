@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import inspect
 import re
@@ -1190,6 +1191,114 @@ class WorkerRateReportingTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(reset, -1, "the worker no longer resets its metrics")
         self.assertNotEqual(spawn, -1)
         self.assertLess(reset, spawn)
+
+
+CONVERSION = (7, "brb")
+
+
+def encode_blocks(positions_s: list[float | None]) -> list[dict[str, str]]:
+    """-progress blocks for a screen encode, one per output position.
+
+    None is ffmpeg's N/A, which is what it reports before the first packet has
+    been written.
+    """
+    return [
+        {
+            "frame": "0",
+            "out_time_us": "N/A" if position is None else str(round(position * 1_000_000)),
+            "speed": "N/A",
+        }
+        for position in positions_s
+    ]
+
+
+class ConversionProgressTest(unittest.IsolatedAsyncioTestCase):
+    """The gauge a screen row shows while its upload converts.
+
+    Drives MediaConversionManager's stdout reader the way the forwarder tests
+    drive theirs: the clock and the pipe are stand-ins, no ffmpeg is spawned,
+    and snapshot() is exactly what /api/state hands the dashboard.
+    """
+
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+        patcher = mock.patch.object(main, "time", self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.manager = main.MediaConversionManager()
+
+    async def asyncSetUp(self) -> None:
+        # snapshot() only speaks for a conversion that is really running, so
+        # stand in for its task with one that never finishes by itself.
+        task = asyncio.get_running_loop().create_future()
+        self.manager.tasks[CONVERSION] = task
+        self.addCleanup(task.cancel)
+
+    async def encode(
+        self, duration_s: float, positions_s: list[float | None], gap: float = 1.0
+    ) -> dict | None:
+        """Start an encode of `duration_s`, feed it one block per `gap` wall
+        seconds, and return what the dashboard would be shown afterwards."""
+        self.manager._begin_encode(CONVERSION, duration_s)
+        stdout = FakeProgressStdout(self.clock, encode_blocks(positions_s), gap)
+        await self.manager._read_progress(stdout, CONVERSION)
+        return self.manager.snapshot(*CONVERSION)
+
+    async def test_the_gauge_follows_ffmpeg_through_the_video(self) -> None:
+        # A 60 s screen encoding at 2x: six wall seconds in, ffmpeg has written
+        # 12 s of it. That is a fifth, and the 48 s still to write take 24 s.
+        snapshot = await self.encode(60.0, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0])
+        self.assertEqual(snapshot, {"stage": "encoding", "fraction": 0.2, "eta_s": 24})
+
+    async def test_no_estimate_until_the_run_can_support_one(self) -> None:
+        """Two seconds in, the run is mostly ffmpeg starting up. The gauge
+        moves, but a time left extrapolated from that would be noise."""
+        snapshot = await self.encode(60.0, [2.0, 4.0])
+        self.assertAlmostEqual(snapshot["fraction"], 4 / 60, places=4)
+        self.assertIsNone(snapshot["eta_s"])
+
+    async def test_nothing_written_yet_is_an_empty_gauge_not_a_guess(self) -> None:
+        # Long enough for an estimate, but nothing to extrapolate from -- and
+        # certainly nothing to divide by.
+        snapshot = await self.encode(60.0, [None, None], gap=2.0)
+        self.assertEqual(snapshot, {"stage": "encoding", "fraction": 0.0, "eta_s": None})
+
+    async def test_not_available_after_a_real_position_holds_the_gauge(self) -> None:
+        snapshot = await self.encode(60.0, [15.0, None])
+        self.assertEqual(snapshot["fraction"], 0.25)
+
+    async def test_the_gauge_stays_between_empty_and_full(self) -> None:
+        # AAC priming puts ffmpeg's first out_time a frame below zero, and the
+        # last audio frame can end a hair past -t. Neither may escape the bar.
+        early = await self.encode(10.0, [-0.021333])
+        self.assertEqual(early["fraction"], 0.0)
+        late = await self.encode(10.0, [10.021333], gap=4.0)
+        self.assertEqual(late, {"stage": "encoding", "fraction": 1.0, "eta_s": 0})
+
+    async def test_the_probe_is_reported_as_work_with_nothing_to_measure(self) -> None:
+        release = asyncio.Event()
+
+        async def convert(*_args: object) -> None:
+            await release.wait()
+
+        with mock.patch.object(self.manager, "_convert", convert):
+            self.manager.start({"id": 8, "slug": "studio"}, "starting_soon", Path("unused"), "clip.mov")
+        snapshot = self.manager.snapshot(8, "starting_soon")
+        release.set()
+        await self.manager.tasks[(8, "starting_soon")]
+        self.assertEqual(snapshot, {"stage": "checking", "fraction": None, "eta_s": None})
+
+    async def test_no_gauge_without_a_conversion_behind_it(self) -> None:
+        """A 'converting' row the router is not actually working on must not
+        get a bar that never moves -- the dashboard would also hold its Upload
+        button for a conversion that is never going to finish."""
+        key = (9, "brb")
+        self.manager._begin_encode(key, 30.0)
+        self.assertIsNone(self.manager.snapshot(*key), "no task was ever started")
+        finished = asyncio.get_running_loop().create_future()
+        finished.set_result(None)
+        self.manager.tasks[key] = finished
+        self.assertIsNone(self.manager.snapshot(*key), "the task has already ended")
 
 
 class SlateRecipeTest(unittest.TestCase):

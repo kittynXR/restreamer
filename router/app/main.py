@@ -19,7 +19,7 @@ from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, AsyncIterable, AsyncIterator, Iterator, Sequence
 from urllib.parse import quote, urlencode, urlparse
 
 import httpx
@@ -67,6 +67,10 @@ MEDIA_MAX_BYTES = 2 * 1024 * 1024 * 1024
 # slate frame reaches a viewer, so the cap is a handoff-latency budget, not just
 # a disk limit. Shorter screens hand off faster; 30 seconds is ideal for BRB.
 MEDIA_MAX_DURATION_SECONDS = 10 * 60
+# A time-left estimate for a screen conversion waits this long into the encode.
+# Earlier than this the run is mostly ffmpeg's start-up, and a straight-line
+# extrapolation from it swings wildly between polls.
+CONVERSION_ESTIMATE_AFTER_SECONDS = 3.0
 INVITE_DEFAULT_DAYS = 7
 INVITE_MAX_DAYS = 30
 
@@ -1155,6 +1159,9 @@ async def generate_placeholder_slate(target: Path, profile: dict[str, Any] | Non
         str(pending),
     ]
     try:
+        # ffmpeg writes the pending file straight into this directory, and on a
+        # fresh volume nothing else has created media/_default yet.
+        target.parent.mkdir(parents=True, exist_ok=True)
         process = await asyncio.create_subprocess_exec(
             *command, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
         )
@@ -1163,7 +1170,6 @@ async def generate_placeholder_slate(target: Path, profile: dict[str, Any] | Non
             log.error("could not render placeholder slate: %s", stderr.decode(errors="replace").strip()[:300])
             pending.unlink(missing_ok=True)
             return False
-        target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(pending, target)
         log.info("rendered placeholder slate at %s", target)
         return True
@@ -1524,6 +1530,11 @@ def media_assets_state(stream: sqlite3.Row) -> dict[str, Any]:
             assets[kind]["status"] == "ready"
             and assets[kind].get("encoder_fingerprint") != fingerprint
         )
+        assets[kind]["progress"] = (
+            media_conversions.snapshot(stream["id"], kind)
+            if assets[kind]["status"] == "converting"
+            else None
+        )
     return {
         "mode": current_screen_mode(stream["id"]),
         "program_mode": current_program_mode(stream["id"]),
@@ -1535,18 +1546,69 @@ def media_assets_state(stream: sqlite3.Row) -> dict[str, Any]:
 class MediaConversionManager:
     def __init__(self) -> None:
         self.tasks: dict[tuple[int, str], asyncio.Task] = {}
+        # How far each running conversion has got, for the dashboard's gauge.
+        # Memory only, like the task it describes: a conversion does not survive
+        # a router restart (initialize_db marks it failed), so neither may its
+        # progress.
+        self.progress: dict[tuple[int, str], dict[str, Any]] = {}
 
     def running(self, stream_id: int, kind: str) -> bool:
         task = self.tasks.get((stream_id, kind))
         return bool(task and not task.done())
 
+    def snapshot(self, stream_id: int, kind: str) -> dict[str, Any] | None:
+        """How far this screen's conversion has got, or None if none is running.
+
+        `checking` is the ffprobe pass, which has nothing to measure. `encoding`
+        reports how much of the video ffmpeg has written, which is honest
+        because the encode is cut to exactly the probed duration. A stored
+        'converting' row with no task behind it gets None rather than a bar
+        that will never move.
+        """
+        entry = self.progress.get((stream_id, kind))
+        if entry is None or not self.running(stream_id, kind):
+            return None
+        if entry["stage"] != "encoding":
+            return {"stage": entry["stage"], "fraction": None, "eta_s": None}
+        fraction = min(max(entry["done_s"] / entry["duration_s"], 0.0), 1.0)
+        elapsed = time.monotonic() - entry["started_at"]
+        eta_s = None
+        if fraction > 0 and elapsed >= CONVERSION_ESTIMATE_AFTER_SECONDS:
+            # Straight-line from the run so far: libx264 at a fixed preset moves
+            # through a screen at a steady rate, and ffmpeg's start-up is in the
+            # elapsed time, so an early estimate errs long rather than short.
+            eta_s = round(elapsed * (1 - fraction) / fraction)
+        return {"stage": "encoding", "fraction": round(fraction, 4), "eta_s": eta_s}
+
     def start(self, stream: sqlite3.Row, kind: str, source: Path, original_name: str) -> None:
         key = (stream["id"], kind)
         if self.running(*key):
             raise HTTPException(status_code=409, detail="That screen is already being converted")
+        self.progress[key] = {"stage": "checking"}
         self.tasks[key] = asyncio.create_task(
             self._convert(dict(stream), kind, source, original_name)
         )
+
+    def _begin_encode(self, key: tuple[int, str], duration_s: float) -> None:
+        self.progress[key] = {
+            "stage": "encoding",
+            "duration_s": duration_s,
+            "done_s": 0.0,
+            "started_at": time.monotonic(),
+        }
+
+    async def _read_progress(self, stream: AsyncIterable[bytes], key: tuple[int, str]) -> None:
+        """Follow the encode's -progress output into self.progress.
+
+        Like the forwarders' reader this must drain stdout to the end while
+        stderr is read alongside it, or ffmpeg blocks once a pipe fills.
+        """
+        async for sample in progress_samples(stream):
+            entry = self.progress.get(key)
+            # N/A before the first packet is written: keep the last position
+            # rather than drop the gauge back to empty.
+            if entry is not None and sample["out_time_s"] is not None:
+                entry["done_s"] = sample["out_time_s"]
 
     async def shutdown(self) -> None:
         for task in self.tasks.values():
@@ -1613,6 +1675,7 @@ class MediaConversionManager:
         source: Path,
         original_name: str,
     ) -> None:
+        key = (stream["id"], kind)
         output = media_asset_path(stream["slug"], kind).with_suffix(".converting.mp4")
         process: asyncio.subprocess.Process | None = None
         try:
@@ -1623,6 +1686,11 @@ class MediaConversionManager:
                 "-hide_banner",
                 "-loglevel",
                 "warning",
+                # The dashboard's conversion gauge, read from stdout.
+                "-progress",
+                "pipe:1",
+                "-stats_period",
+                "1",
                 "-y",
                 "-i",
                 str(source),
@@ -1670,12 +1738,18 @@ class MediaConversionManager:
                     str(output),
                 ]
             )
+            self._begin_encode(key, duration)
             process = await asyncio.create_subprocess_exec(
                 *command,
-                stdout=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await process.communicate()
+            assert process.stdout is not None and process.stderr is not None
+            _, stderr = await asyncio.gather(
+                self._read_progress(process.stdout, key),
+                process.stderr.read(),
+            )
+            await process.wait()
             if process.returncode:
                 detail = stderr.decode(errors="replace").strip().splitlines()
                 raise RuntimeError(detail[-1] if detail else "FFmpeg could not convert this video")
@@ -1704,6 +1778,7 @@ class MediaConversionManager:
         except Exception as exc:
             self._set_status(stream["id"], kind, "error", original_name, redact(str(exc))[:500])
         finally:
+            self.progress.pop(key, None)
             source.unlink(missing_ok=True)
             output.unlink(missing_ok=True)
 
@@ -1830,6 +1905,26 @@ def parse_progress_block(block: dict[str, str]) -> dict[str, Any]:
     }
 
 
+async def progress_samples(stream: AsyncIterable[bytes]) -> AsyncIterator[dict[str, Any]]:
+    """One parse_progress_block() sample per ffmpeg -progress block.
+
+    ffmpeg writes key=value lines and closes every block with a progress= line,
+    so nothing is parsed until that line arrives. The stream is always read to
+    its end, whatever it contains.
+    """
+    block: dict[str, str] = {}
+    async for raw_line in stream:
+        line = raw_line.decode(errors="replace").strip()
+        if not line or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        block[key.strip()] = value
+        if key.strip() != "progress":
+            continue
+        yield parse_progress_block(block)
+        block = {}
+
+
 def derive_output_rate(
     history: Sequence[tuple[float, float]],
     window_s: float = METRICS_OUTPUT_RATE_WINDOW_S,
@@ -1951,17 +2046,7 @@ class WorkerManager:
         This must run concurrently with the stderr reader: an undrained pipe
         deadlocks ffmpeg once 64 KiB accumulates.
         """
-        block: dict[str, str] = {}
-        async for raw_line in stream:
-            line = raw_line.decode(errors="replace").strip()
-            if not line or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            block[key.strip()] = value
-            if key.strip() != "progress":
-                continue
-            sample = parse_progress_block(block)
-            block = {}
+        async for sample in progress_samples(stream):
             entry = self.metrics.get(destination_id)
             if entry is None:
                 continue

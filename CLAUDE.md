@@ -47,7 +47,7 @@ MediaMTX (UDP 8890 SRT in) → per-user path named by the stream slug → intern
 - `PathReconciler` — every 10s, PATCHes a MediaMTX path config per enabled user via the MediaMTX API so `alwaysAvailableFile` points at `/relay-data/media/<slug>/active.mp4`.
 - `TwitchIngestManager` — probes `ingest.twitch.tv/ingests` TCP-connect latency every 6h, stores the winner in `app_settings`, and validates that any candidate template is `rtmps://…live-video.net` with `{stream_key}`.
 - `WorkerManager` — one `asyncio.Task` per enabled destination, each running an FFmpeg retry loop.
-- `MediaConversionManager` — ffprobe-validates then re-encodes uploaded BRB/Starting Soon screens to match that stream's own probed contribution format (see `slate_encode_args`), always with two audio tracks.
+- `MediaConversionManager` — ffprobe-validates then re-encodes uploaded BRB/Starting Soon screens to match that stream's own probed contribution format (see `slate_encode_args`), always with two audio tracks. It follows the encode's `-progress` output (through the same `progress_samples` parser the workers use) so `/api/state` can show a conversion gauge; that progress is in memory only and reported only while the task is really running.
 - `FailoverAdManager` — 3s poll of every stream's MediaMTX online state; also the token-validation sweep, the BRB pre-staging, the optional fast-handoff watchdog, and the contribution-format probe on the offline→online edge.
 - `SignalMetrics` — 1s poll of MediaMTX paths/srtconns/rtspsessions into per-stream ring buffers; the single shared snapshot every other caller reads.
 

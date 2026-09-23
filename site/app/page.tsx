@@ -50,7 +50,18 @@ type Destination = { id: number; name: string; platform: string; enabled: number
 type MediaTrack = { codec?: string; codecProps?: { sampleRate?: number } };
 type TwitchEvent = { checked_at: string; preroll_before?: number | null; requested_length?: number | null; status: string; message?: string | null };
 type TwitchState = { available: boolean; connected: boolean; login?: string | null; failover_ads_enabled: boolean; grace_seconds: number; last_event?: TwitchEvent | null };
-type ScreenAsset = { kind: string; status: "missing" | "converting" | "ready" | "error"; original_name?: string | null; message?: string | null; updated_at?: string | null; stale?: boolean };
+type ScreenKind = "brb" | "starting_soon";
+// Present only while the router is actually running this screen's conversion —
+// see MediaConversionManager.snapshot(). `checking` is the ffprobe pass and has
+// nothing to measure; `encoding` carries how much of the video FFmpeg has
+// written and, once the run is long enough to extrapolate from, the seconds it
+// expects still to need.
+type ScreenProgress = { stage: "checking" | "encoding"; fraction?: number | null; eta_s?: number | null };
+type ScreenAsset = { kind: string; status: "missing" | "converting" | "ready" | "error"; original_name?: string | null; message?: string | null; updated_at?: string | null; stale?: boolean; progress?: ScreenProgress | null };
+// A screen upload leaving this browser. Only this tab can know about it: the
+// router receives the whole file before it knows an upload happened, so none of
+// this reaches /api/state until the conversion starts.
+type ScreenUpload = { kind: ScreenKind; loaded: number; total: number; eta_s: number | null };
 type StreamState = {
   user: User;
   csrf: string;
@@ -480,6 +491,68 @@ function MusicFallbackChoice({ value, busy = false, group, owner, onChoose }: { 
   );
 }
 
+/** A rate-based estimate, so it is worded like one: seconds rounded up to the
+ *  next five under a minute, whole minutes above that. */
+function formatEta(seconds: number): string {
+  if (seconds <= 0) return "finishing up";
+  const rounded = Math.ceil(seconds / 5) * 5;
+  return rounded < 60 ? `about ${rounded}s left` : `about ${Math.round(seconds / 60)} min left`;
+}
+
+type ScreenActivity = { label: "upload" | "conversion"; text: string; fraction: number | null };
+
+/** What a screen row reports while a new video is on its way to air: the
+ *  upload from this browser first, then the router's conversion. null when
+ *  neither is running and the row describes the stored screen instead.
+ *
+ *  A null fraction is work nobody can measure yet — the router taking delivery
+ *  of the file, or ffprobe checking it — and draws a sweeping bar rather than
+ *  one parked at 0%, which would read as stuck. */
+function screenActivity(asset: ScreenAsset, upload: ScreenUpload | null): ScreenActivity | null {
+  if (upload) {
+    if (upload.loaded >= upload.total) return { label: "upload", text: "Upload complete · starting the conversion…", fraction: null };
+    const left = upload.eta_s != null ? ` · ${formatEta(upload.eta_s)}` : "";
+    return { label: "upload", text: `Uploading · ${formatBytes(upload.loaded)} of ${formatBytes(upload.total)}${left}`, fraction: upload.loaded / upload.total };
+  }
+  const progress = asset.status === "converting" ? asset.progress : null;
+  if (!progress) return null;
+  if (progress.stage !== "encoding" || progress.fraction == null) return { label: "conversion", text: "Checking the video…", fraction: null };
+  const left = progress.eta_s != null ? ` · ${formatEta(progress.eta_s)}` : "";
+  return { label: "conversion", text: `Converting on the VPS${left}`, fraction: progress.fraction };
+}
+
+/** One program-source screen: what is stored, how far a replacement has got,
+ *  and the switch that puts it on air. */
+function ScreenRow({ kind, title, name, ready, missing, asset, upload, onAir, switchBusy, onUpload, onSwitch }: { kind: ScreenKind; title: string; name: string; ready: string; missing: string; asset: ScreenAsset; upload: ScreenUpload | null; onAir: boolean; switchBusy: boolean; onUpload: (kind: ScreenKind, file: File | undefined) => void; onSwitch: () => void }) {
+  const uploading = upload?.kind === kind;
+  const activity = screenActivity(asset, uploading ? upload : null);
+  // A new upload during this screen's conversion would travel in full only to
+  // be refused with a 409, so the button waits for the conversion as well.
+  const converting = asset.status === "converting" && Boolean(asset.progress);
+  // Floored, so 100% only ever means done.
+  const percent = activity?.fraction != null ? Math.floor(Math.min(Math.max(activity.fraction, 0), 1) * 100) : null;
+  const line = activity ? activity.text
+    : asset.stale ? "Re-upload to get the faster handoff"
+    : asset.status === "ready" ? asset.original_name || ready
+    : asset.status === "converting" ? "Converting on the VPS…"
+    : asset.status === "error" ? asset.message
+    : missing;
+  return (
+    <div className="screen-item">
+      <div className="screen-summary">
+        <strong>{title}</strong><span>{line}</span>
+        {activity && (
+          <div className="screen-gauge">
+            <div className={`screen-gauge-track${percent == null ? " indeterminate" : ""}`} role="progressbar" aria-label={`${name} screen ${activity.label}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined} aria-valuetext={percent == null ? activity.text : `${percent}% · ${activity.text}`}><i style={percent == null ? undefined : { width: `${percent}%` }} /></div>
+            {percent != null && <b aria-hidden="true">{percent}%</b>}
+          </div>
+        )}
+      </div>
+      <div className="screen-item-controls"><label className={"upload-button " + (uploading || converting ? "busy" : "")}>{uploading ? "Uploading…" : "Upload"}<input type="file" accept="video/*,.mov,.mkv,.mp4,.webm" disabled={Boolean(upload) || converting} onChange={(event) => { onUpload(kind, event.target.files?.[0]); event.currentTarget.value = ""; }} /></label><button className={`toggle screen-toggle ${onAir ? "on" : ""}`} type="button" role="switch" aria-checked={onAir} aria-label={onAir ? `Turn off ${name} and return to live input` : `Put ${name} on air`} disabled={switchBusy || asset.status !== "ready"} onClick={onSwitch}><span /></button></div>
+    </div>
+  );
+}
+
 const platformMarks: Record<string, { src: string; label: string }> = {
   twitch: { src: "/logos/twitch.svg", label: "Twitch" },
   youtube: { src: "/logos/youtube.svg", label: "YouTube" },
@@ -504,6 +577,28 @@ async function json<T>(url: string, options?: RequestInit): Promise<T> {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new ApiError(response.status, body.detail || "Something went wrong");
   return body as T;
+}
+
+/** fetch() cannot watch a request body leave, so the one request that needs an
+ *  upload gauge goes through XMLHttpRequest instead. It fails with the same
+ *  ApiError json() raises, so callers handle both alike. */
+function sendWithProgress<T>(url: string, body: FormData, csrf: string, onProgress: (loaded: number, total: number) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", url);
+    request.responseType = "json";
+    request.setRequestHeader("X-CSRF-Token", csrf);
+    const report = (event: ProgressEvent) => { if (event.lengthComputable) onProgress(event.loaded, event.total); };
+    request.upload.onprogress = report;
+    request.upload.onload = report;
+    request.onload = () => {
+      const payload = request.response ?? {};
+      if (request.status >= 200 && request.status < 300) resolve(payload as T);
+      else reject(new ApiError(request.status, typeof payload.detail === "string" ? payload.detail : "Something went wrong"));
+    };
+    request.onerror = () => reject(new Error("The upload was interrupted. Check your connection and try again."));
+    request.send(body);
+  });
 }
 
 function isSignedOut(err: unknown): boolean {
@@ -539,7 +634,7 @@ export default function Home() {
   const [pendingAutoArm, setPendingAutoArm] = useState(false);
   const [pendingScreenMode, setPendingScreenMode] = useState<"live" | "brb" | "starting_soon" | null>(null);
   const [protectionBusy, setProtectionBusy] = useState(false);
-  const [uploadBusy, setUploadBusy] = useState<"" | "brb" | "starting_soon">("");
+  const [upload, setUpload] = useState<ScreenUpload | null>(null);
   const [inviteToken, setInviteToken] = useState<string | null>(null);
   const [inviteChecked, setInviteChecked] = useState(false);
   const [stateError, setStateError] = useState("");
@@ -759,15 +854,28 @@ export default function Home() {
     await navigator.clipboard.writeText(state!.stream.obs_url); setCopied(true); window.setTimeout(() => setCopied(false), 1800);
   }
 
-  async function uploadScreen(kind: "brb" | "starting_soon", file: File | undefined) {
+  async function uploadScreen(kind: ScreenKind, file: File | undefined) {
     if (!file) return;
-    setError(""); setUploadBusy(kind);
+    setError(""); setUpload({ kind, loaded: 0, total: file.size, eta_s: null });
     const form = new FormData(); form.append("file", file);
+    const started = performance.now();
+    let shownPercent = -1;
+    let shownAt = 0;
     try {
-      await json(`/api/screens/${kind}`, { method:"POST", headers:{"X-CSRF-Token":state!.csrf}, body:form });
+      await sendWithProgress(`/api/screens/${kind}`, form, state!.csrf, (loaded, total) => {
+        const now = performance.now();
+        const percent = Math.floor((loaded / total) * 100);
+        // One render per whole percent or per second, not one per network chunk.
+        if (percent === shownPercent && now - shownAt < 1000) return;
+        shownPercent = percent; shownAt = now;
+        // The average rate since the upload began: a single slow chunk on a
+        // shaky uplink should not swing the estimate.
+        const elapsed = (now - started) / 1000;
+        setUpload({ kind, loaded, total, eta_s: elapsed >= 3 && loaded > 0 ? ((total - loaded) * elapsed) / loaded : null });
+      });
       await refreshState();
     } catch (err) { setError(err instanceof Error ? err.message : "Could not upload screen"); }
-    finally { setUploadBusy(""); }
+    finally { setUpload(null); }
   }
 
   async function changeScreenMode(mode: "live" | "brb" | "starting_soon") {
@@ -851,14 +959,8 @@ export default function Home() {
             <div className="control-card-head"><div><p className="eyebrow">PROGRAM SOURCE</p><h2>Stream screens</h2></div><span className={`status-chip ${programMode === "live" ? "disabled" : "armed"}`}>{programLabel}</span></div>
             <p className="control-copy">Choose what viewers see. Turning on a screen safely takes over from OBS while keeping enabled destinations connected.</p>
             <div className="screen-list">
-              <div className="screen-item">
-                <div><strong>BRB / connection lost</strong><span>{state.screens.brb.stale ? "Re-upload to get the faster handoff" : state.screens.brb.status === "ready" ? state.screens.brb.original_name || "Default screen ready" : state.screens.brb.status === "converting" ? "Converting on the VPS…" : state.screens.brb.status === "error" ? state.screens.brb.message : "Default screen unavailable"}</span></div>
-                <div className="screen-item-controls"><label className={"upload-button " + (uploadBusy === "brb" ? "busy" : "")}>{uploadBusy === "brb" ? "Uploading…" : "Upload"}<input type="file" accept="video/*,.mov,.mkv,.mp4,.webm" disabled={Boolean(uploadBusy)} onChange={(event) => { uploadScreen("brb", event.target.files?.[0]); event.currentTarget.value = ""; }} /></label><button className={`toggle screen-toggle ${programMode === "brb" ? "on" : ""}`} type="button" role="switch" aria-checked={programMode === "brb"} aria-label={programMode === "brb" ? "Turn off BRB and return to live input" : "Put BRB on air"} disabled={protectionBusy || state.screens.brb.status !== "ready"} onClick={() => setPendingScreenMode(programMode === "brb" ? "live" : "brb")}><span /></button></div>
-              </div>
-              <div className="screen-item">
-                <div><strong>Starting Soon</strong><span>{state.screens.starting_soon.stale ? "Re-upload to get the faster handoff" : state.screens.starting_soon.status === "ready" ? state.screens.starting_soon.original_name || "Ready" : state.screens.starting_soon.status === "converting" ? "Converting on the VPS…" : state.screens.starting_soon.status === "error" ? state.screens.starting_soon.message : "Upload a video to enable"}</span></div>
-                <div className="screen-item-controls"><label className={"upload-button " + (uploadBusy === "starting_soon" ? "busy" : "")}>{uploadBusy === "starting_soon" ? "Uploading…" : "Upload"}<input type="file" accept="video/*,.mov,.mkv,.mp4,.webm" disabled={Boolean(uploadBusy)} onChange={(event) => { uploadScreen("starting_soon", event.target.files?.[0]); event.currentTarget.value = ""; }} /></label><button className={`toggle screen-toggle ${programMode === "starting_soon" ? "on" : ""}`} type="button" role="switch" aria-checked={programMode === "starting_soon"} aria-label={programMode === "starting_soon" ? "Turn off Starting Soon and return to live input" : "Put Starting Soon on air"} disabled={protectionBusy || state.screens.starting_soon.status !== "ready"} onClick={() => setPendingScreenMode(programMode === "starting_soon" ? "live" : "starting_soon")}><span /></button></div>
-              </div>
+              <ScreenRow kind="brb" title="BRB / connection lost" name="BRB" ready="Default screen ready" missing="Default screen unavailable" asset={state.screens.brb} upload={upload} onAir={programMode === "brb"} switchBusy={protectionBusy} onUpload={uploadScreen} onSwitch={() => setPendingScreenMode(programMode === "brb" ? "live" : "brb")} />
+              <ScreenRow kind="starting_soon" title="Starting Soon" name="Starting Soon" ready="Ready" missing="Upload a video to enable" asset={state.screens.starting_soon} upload={upload} onAir={programMode === "starting_soon"} switchBusy={protectionBusy} onUpload={uploadScreen} onSwitch={() => setPendingScreenMode(programMode === "starting_soon" ? "live" : "starting_soon")} />
             </div>
             <div className="screen-actions">{programMode !== "live" && <button className="primary" disabled={protectionBusy} onClick={() => setPendingScreenMode("live")}>Return to live input</button>}<span>{programMode === "live" ? "Both screen switches are off. OBS is the program source." : "Relay will allow OBS to reconnect when you return to live input."}</span></div>
           </article>

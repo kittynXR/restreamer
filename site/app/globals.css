@@ -124,6 +124,25 @@ html,body { background:#000; }
 .upload-button:hover { border-color:#4c5b53; background:#111713; }
 .upload-button.busy { opacity:.58; cursor:wait; }
 .upload-button input { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+/* Held while another upload is running. The input underneath is disabled, so
+   without this the label would look clickable and do nothing. */
+.upload-button:has(input:disabled):not(.busy) { opacity:.5; cursor:not-allowed; }
+.upload-button:has(input:disabled):hover { border-color:#2d3933; background:#0c110e; }
+/* Upload and conversion gauge. The text column has to grow for the bar to
+   have any width; idle rows look the same because their copy is left-aligned
+   either way. */
+.screen-summary { flex:1 1 auto; }
+.screen-gauge { margin-top:8px; display:flex; align-items:center; gap:9px; }
+.screen-gauge-track { position:relative; flex:1 1 auto; height:4px; overflow:hidden; border-radius:999px; background:#1b2420; box-shadow:0 0 14px rgba(53,220,138,.08); }
+.screen-gauge-track i { position:absolute; top:0; bottom:0; left:0; border-radius:inherit; background:var(--green); transition:width .6s ease; }
+.screen-gauge b { flex:0 0 auto; min-width:4ch; color:#dff8e9; font-family:var(--font-geist-mono),monospace; font-size:11px; font-weight:600; text-align:right; }
+/* Work with nothing to measure yet: a sweep, never a bar parked at 0%. */
+.screen-gauge-track.indeterminate i { width:35%; animation:gauge-sweep 1.4s ease-in-out infinite; }
+@keyframes gauge-sweep { from { transform:translateX(-100%); } to { transform:translateX(290%); } }
+@media (prefers-reduced-motion:reduce) {
+  .screen-gauge-track i { transition:none; }
+  .screen-gauge-track.indeterminate i { width:100%; opacity:.35; animation:none; }
+}
 .screen-actions { margin-top:14px; display:flex; align-items:center; gap:12px; }
 .screen-actions span,.auto-ad-actions>span { color:var(--muted); font-size:11px; line-height:1.4; }
 .integration-empty { padding:16px; border:1px dashed #303934; border-radius:11px; color:var(--muted); font-size:13px; text-align:center; }

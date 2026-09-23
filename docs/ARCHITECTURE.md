@@ -28,6 +28,8 @@ The database and media files live beneath `/data` in the `relay_data` Docker vol
 
 The React/Vinext dashboard is a client-rendered control surface. It polls `/api/state`, sends CSRF-protected mutations to the router, and never receives stored destination keys or OAuth tokens. It includes onboarding because invited streamers may not be technical.
 
+Screen uploads show two gauges in turn. The upload itself goes through `XMLHttpRequest`, because `fetch` cannot report a request body leaving the browser, so only the uploading tab sees it. Once the router has the file, the screen's entry in `/api/state` carries `progress` — the stage, the fraction FFmpeg has written, and a time-left estimate — for as long as that conversion is actually running. The router reads it from the encode's own `-progress` output and keeps it in memory only.
+
 ### FFmpeg workers
 
 Each enabled destination has an independent worker. A worker reads the user’s MediaMTX path over internal RTSP and reconnects after failures.
