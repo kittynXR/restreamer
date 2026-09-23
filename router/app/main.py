@@ -2476,6 +2476,11 @@ class ProgramSwitch:
         return self.wakeups.setdefault(slug, asyncio.Event())
 
     def _set_state(self, slug: str, state: str, error: str | None = None) -> None:
+        entry = self.status.get(slug)
+        # The loop restates "stopped"/"waiting" every second; `since` is when the
+        # state was entered, not when it was last confirmed.
+        if entry and entry["state"] == state and entry["last_error"] == error:
+            return
         self.status[slug] = {"state": state, "last_error": error, "since": time.monotonic()}
 
     def snapshot(self, slug: str) -> dict[str, Any]:
@@ -2600,7 +2605,10 @@ class ProgramSwitch:
         always-available file's, and ffmpeg only ever sees the RTSP status
         line, so the layouts are compared here to say what actually went wrong.
         """
-        if any(re.search(r"method (ANNOUNCE|RECORD) failed", line) for line in errors):
+        # ffmpeg reports a refused RTSP publish as a header write failure
+        # ("Could not write header (incorrect codec parameters ?)"), and older
+        # builds name the method instead.
+        if any(re.search(r"method (ANNOUNCE|RECORD) failed|Could not write header", line) for line in errors):
             sending = audio_track_count(await media_status(slug))
             expected = audio_track_count(await program_status(slug))
             if sending is not None and expected is not None and sending != expected:
